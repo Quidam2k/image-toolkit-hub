@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# User data - sorting destination folders
+1/
+2/
+3/
+removed/
+unmatched/
+recycle_bin/
+
+# Image collections - user content
+master_images/
+master_images_old/
+master_images_test/
+auto_sorted/
+sorted_*/
+tshirt_ready_*/
+batch_exports/
+processed_batches/
+
+# Large ML models (download separately)
+models/
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.bin
+
+# Databases (user-generated)
+*.db
+!tests/test_*.db
+
+# User configuration (contains local paths)
+hub_config.json
+imagesorter_config.json
+
+# Backup folders
+backups/
+prompt_backups/
+prompt_backup_emergency/
+
+# Logs
+logs/
+*.log
+
+# Data caches and large files
+data/background_tag_cache.json
+data/tag_frequency.json
+data/danbooru_tagcomplete.csv
+data/clip_vocabulary_comprehensive.txt
+data/*.json
+!data/.gitkeep
+
+# Archive (old files and screenshots)
+archive/
+
+# Session notes (development history)
+docs/sessions/
+
+# Test artifacts
+tests/test_tag_database.db
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp files
+*.tmp
+*.temp
+*.bak
+
+# Windows reserved names
+nul
+con
+prn
+aux
