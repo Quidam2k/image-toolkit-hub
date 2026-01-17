@@ -2,54 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import os
 from batch_export_dialog import BatchExportDialog
-
-
-
-class ModernStyle:
-    """Modern dark theme - matches hub styling."""
-    BG_DARK = "#1a1a2e"
-    BG_CARD = "#16213e"
-    BG_HOVER = "#1f3460"
-    BG_INPUT = "#0f172a"
-    ACCENT = "#7c3aed"
-    ACCENT_HOVER = "#8b5cf6"
-    TEXT = "#e2e8f0"
-    TEXT_DIM = "#94a3b8"
-    TEXT_MUTED = "#64748b"
-    SUCCESS = "#10b981"
-    WARNING = "#f59e0b"
-    ERROR = "#ef4444"
-    BORDER = "#334155"
-
-    FONT_TITLE = ("Segoe UI", 16, "bold")
-    FONT_HEADING = ("Segoe UI", 11, "bold")
-    FONT_BODY = ("Segoe UI", 10)
-    FONT_SMALL = ("Segoe UI", 9)
-
-    @classmethod
-    def apply(cls, root):
-        """Apply modern styling to ttk widgets."""
-        style = ttk.Style(root)
-        style.theme_use("clam")
-
-        style.configure(".", background=cls.BG_DARK, foreground=cls.TEXT, font=cls.FONT_BODY)
-        style.configure("TFrame", background=cls.BG_DARK)
-        style.configure("Card.TFrame", background=cls.BG_CARD)
-        style.configure("TLabel", background=cls.BG_DARK, foreground=cls.TEXT)
-        style.configure("Card.TLabel", background=cls.BG_CARD, foreground=cls.TEXT)
-        style.configure("Dim.TLabel", background=cls.BG_DARK, foreground=cls.TEXT_DIM)
-        style.configure("Title.TLabel", background=cls.BG_DARK, foreground=cls.TEXT, font=cls.FONT_TITLE)
-        style.configure("Heading.TLabel", background=cls.BG_CARD, foreground=cls.TEXT, font=cls.FONT_HEADING)
-        style.configure("TButton", background=cls.ACCENT, foreground=cls.TEXT, padding=(12, 6), font=cls.FONT_BODY)
-        style.map("TButton", background=[("active", cls.ACCENT_HOVER), ("disabled", cls.BG_CARD)])
-        style.configure("Secondary.TButton", background=cls.BG_CARD, foreground=cls.TEXT, padding=(12, 6))
-        style.map("Secondary.TButton", background=[("active", cls.BG_HOVER)])
-        style.configure("TCheckbutton", background=cls.BG_CARD, foreground=cls.TEXT)
-        style.map("TCheckbutton", background=[("active", cls.BG_CARD)])
-        style.configure("TLabelframe", background=cls.BG_CARD, foreground=cls.TEXT, bordercolor=cls.BORDER)
-        style.configure("TLabelframe.Label", background=cls.BG_CARD, foreground=cls.ACCENT, font=cls.FONT_HEADING)
-        style.configure("Vertical.TScrollbar", background=cls.BG_CARD, troughcolor=cls.BG_DARK, arrowcolor=cls.TEXT)
-        style.configure("TSpinbox", background=cls.BG_INPUT, foreground=cls.TEXT, fieldbackground=cls.BG_INPUT, arrowcolor=cls.TEXT)
+from ui_theme import Theme as ModernStyle
 
 class SetupDialog:
     def __init__(self, parent=None, config_manager=None):

@@ -18,7 +18,7 @@ import os
 import json
 import logging
 from datetime import datetime
-from tag_extractor import TagExtractor
+from tag_extractor_v2 import TagExtractorV2 as TagExtractor
 
 logging.basicConfig(
     level=logging.INFO,

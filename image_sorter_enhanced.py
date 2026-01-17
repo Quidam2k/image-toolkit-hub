@@ -298,7 +298,7 @@ class ImageSorter(tk.Tk):
         self.bind('3', self.handle_key_binding)
         self.bind('<space>', self.handle_key_binding)
         self.bind('r', self.handle_key_binding)
-        self.bind('c', self.handle_key_binding)
+        self.bind('R', self.launch_ranker_for_category1)  # Shift+R opens ranker for sorted folder 1
         self.bind('<Control-a>', self.auto_sort_all)
         self.bind('<Control-t>', self.open_term_manager)
         self.bind('<Control-z>', lambda e: self.undo_last_operation())
@@ -422,6 +422,8 @@ class ImageSorter(tk.Tk):
         tools_menu.add_command(label="Visual Sort (LoRA Workflow)...", command=self.open_visual_sort)
         tools_menu.add_command(label="Find T-Shirt Ready Images...", command=self.open_background_sort)
         tools_menu.add_separator()
+        tools_menu.add_command(label="Image Ranker...", command=self.open_image_ranker)
+        tools_menu.add_separator()
         tools_menu.add_command(label="Embed Tag Files in Images", command=self.embed_tag_files)
         tools_menu.add_separator()
         tools_menu.add_command(label="Export Terms", command=self.export_terms)
@@ -439,43 +441,61 @@ class ImageSorter(tk.Tk):
         """Add auto-sort controls to the main window."""
         toolbar_frame = ttk.Frame(self.main_container)
         toolbar_frame.pack(fill="x", padx=5, pady=2)
-        
+
+        # Quick actions section (left side)
+        actions_frame = ttk.LabelFrame(toolbar_frame, text="Actions")
+        actions_frame.pack(side="left", padx=(0, 10))
+
+        # Settings button
+        ttk.Button(
+            actions_frame,
+            text="Settings",
+            command=lambda: self.change_folder(None)
+        ).pack(side="left", padx=3, pady=2)
+
+        # Rank Sorted button - opens ranker with category 1 folder
+        ttk.Button(
+            actions_frame,
+            text="Rank Sorted",
+            command=self.launch_ranker_for_category1
+        ).pack(side="left", padx=3, pady=2)
+
         # Auto-sort section
         auto_sort_frame = ttk.LabelFrame(toolbar_frame, text="Auto-Sort")
         auto_sort_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        
+
         # Quick auto-sort button
         ttk.Button(
-            auto_sort_frame, 
-            text="Auto-Sort All", 
+            auto_sort_frame,
+            text="Auto-Sort All",
             command=self.auto_sort_all
-        ).pack(side="left", padx=5, pady=2)
-        
+        ).pack(side="left", padx=3, pady=2)
+
         # Current batch auto-sort
         ttk.Button(
             auto_sort_frame,
             text="Auto-Sort Batch",
             command=self.auto_sort_batch
-        ).pack(side="left", padx=5, pady=2)
-        
+        ).pack(side="left", padx=3, pady=2)
+
         # Term manager button
         ttk.Button(
             auto_sort_frame,
             text="Manage Terms",
             command=self.open_term_manager
-        ).pack(side="left", padx=5, pady=2)
-        
+        ).pack(side="left", padx=3, pady=2)
+
         # Metadata status
         self.metadata_status = ttk.Label(
             auto_sort_frame,
             text="Metadata: Ready"
         )
         self.metadata_status.pack(side="right", padx=5, pady=2)
-        
+
         # Statistics section
         stats_frame = ttk.LabelFrame(toolbar_frame, text="Statistics")
         stats_frame.pack(side="right", padx=(10, 0))
-        
+
         self.stats_label = ttk.Label(
             stats_frame,
             text="Images: 0 | Processed: 0"
@@ -495,9 +515,7 @@ class ImageSorter(tk.Tk):
             key_name = f'key_{event.char}'
         elif event.char.lower() == 'r':
             key_name = 'key_r'
-        elif event.char.lower() == 'c':
-            key_name = 'key_c'
-            
+
         if key_name and key_name in self.bindings:
             action = self.bindings[key_name]
             self.perform_action(action)
@@ -715,11 +733,17 @@ class ImageSorter(tk.Tk):
         
         # Start with preloaded images
         preloaded_used = 0
-        for _ in range(len(self.preloaded_images)):
-            if self.preloaded_images:
-                image_file, tk_img, img_width, aspect_ratio = self.preloaded_images.pop(0)
-                self._try_place_image_immediately(image_file, tk_img, img_width, aspect_ratio, row_widths)
+        while self.preloaded_images:
+            image_file, tk_img, img_width, aspect_ratio = self.preloaded_images.pop(0)
+            if self._try_place_image_immediately(image_file, tk_img, img_width, aspect_ratio, row_widths):
                 preloaded_used += 1
+            else:
+                # Can't place this image - rows are full
+                # Put back this image and all remaining preloaded images into main queue
+                files_to_restore = [image_file] + [f for f, _, _, _ in self.preloaded_images]
+                self.images = files_to_restore + self.images
+                self.preloaded_images.clear()
+                break  # Stop trying preloaded images, rows are full
         
         # Continue loading and placing images until ALL rows are filled or no more images
         images_processed = 0
@@ -1671,6 +1695,38 @@ class ImageSorter(tk.Tk):
         """Open the term manager dialog."""
         TermManagerDialog(self, self.config_manager)
 
+    def launch_ranker_for_category1(self, event=None):
+        """Launch the image ranker pre-loaded with category 1 (left-click) folder."""
+        try:
+            from image_ranker_dialog import ImageRankerDialog
+
+            # Get the category 1 folder path
+            category1_folder = self.sorted_folders.get('1')
+            if not category1_folder or not os.path.exists(category1_folder):
+                messagebox.showinfo(
+                    "No Images",
+                    "Category 1 folder doesn't exist yet.\n"
+                    "Sort some images with left-click first!"
+                )
+                return
+
+            # Check if there are images in the folder
+            images = [f for f in os.listdir(category1_folder)
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))]
+            if not images:
+                messagebox.showinfo(
+                    "No Images",
+                    "No images in category 1 folder yet.\n"
+                    "Sort some images with left-click first!"
+                )
+                return
+
+            # Launch ranker with this folder pre-loaded
+            dialog = ImageRankerDialog(self, self.config_manager, initial_folder=category1_folder)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch ranker: {e}")
+
     def scan_metadata(self):
         """Scan metadata for current batch."""
         if not self.current_batch:
@@ -1841,6 +1897,15 @@ class ImageSorter(tk.Tk):
             show_background_sort_dialog(self, self.config_manager)
         except Exception as e:
             messagebox.showerror("Error", f"Could not open background sort tool: {str(e)}")
+
+    def open_image_ranker(self):
+        """Open the image ranker dialog for pairwise comparison ranking."""
+        try:
+            from image_ranker_dialog import ImageRankerDialog
+            ImageRankerDialog(self, self.config_manager)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open image ranker: {str(e)}")
+            logging.exception("Error opening image ranker")
 
     def _execute_visual_sort(self, sort_config, image_files):
         """Execute the visual sort operation based on dialog result."""
@@ -2329,34 +2394,50 @@ if __name__ == '__main__':
     try:
         # Initialize config manager
         config_manager = ConfigManager()
-        
+
         # Load basic settings
         settings = config_manager.get_basic_settings()
-        
-        # Always show configuration dialog on startup
-        # Create a temporary root window for the dialog
-        temp_root = tk.Tk()
-        temp_root.withdraw()  # Hide the temporary window
-        
-        result = show_setup_dialog(None, config_manager)
-        temp_root.destroy()
-        
-        if not result:
-            print("Configuration cancelled by user.")
-            sys.exit(0)
-        
-        # Use settings from dialog
-        settings = result
-        folder = result['folder']
-        
-        # Start the main application
-        app = ImageSorter(
-            folder, 
-            settings['num_rows'], 
-            settings['random_order'], 
-            settings['copy_instead_of_move']
-        )
-        app.mainloop()
+
+        # Check if we have valid source folders already configured
+        active_sources = config_manager.get_active_source_folders()
+        valid_sources = [f for f in active_sources if os.path.exists(f)]
+
+        if valid_sources:
+            # Skip setup dialog - use existing config
+            folder = valid_sources[0] if valid_sources else ''
+
+            # Start the main application directly
+            app = ImageSorter(
+                folder,
+                settings['num_rows'],
+                settings['random_order'],
+                settings['copy_instead_of_move']
+            )
+            app.mainloop()
+        else:
+            # No valid sources - show configuration dialog
+            temp_root = tk.Tk()
+            temp_root.withdraw()  # Hide the temporary window
+
+            result = show_setup_dialog(None, config_manager)
+            temp_root.destroy()
+
+            if not result:
+                print("Configuration cancelled by user.")
+                sys.exit(0)
+
+            # Use settings from dialog
+            settings = result
+            folder = result['folder']
+
+            # Start the main application
+            app = ImageSorter(
+                folder,
+                settings['num_rows'],
+                settings['random_order'],
+                settings['copy_instead_of_move']
+            )
+            app.mainloop()
         
     except Exception as e:
         print(f"Error starting application: {e}")

@@ -17,7 +17,7 @@ import sys
 import json
 from datetime import datetime
 from tag_generator import DescriptiveTagGenerator
-from tag_extractor import TagExtractor
+from tag_extractor_v2 import TagExtractorV2 as TagExtractor
 from tag_embedder import TagEmbedder
 from prompt_preservation_audit import PromptPreservationAudit
 from tag_frequency_database import TagFrequencyDatabase

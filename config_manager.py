@@ -106,9 +106,9 @@ class ConfigManager:
                 'key_3': '3',
                 'key_space': 'next',
                 'key_r': 'reload',
-                'key_escape': 'exit',
-                'key_c': 'config'
-            }
+                'key_escape': 'exit'
+            },
+            'handle_tag_files': True
         }
         
         self.config = self.load_config()
@@ -535,7 +535,37 @@ class ConfigManager:
     def get_bindings(self):
         """Get key/mouse bindings."""
         return self.config.get('bindings', {})
-    
+
+    def get_setting(self, key, default=None):
+        """Get a setting value, checking nested locations."""
+        # Check top-level first
+        if key in self.config:
+            return self.config[key]
+        # Check ui_preferences
+        if key in self.config.get('ui_preferences', {}):
+            return self.config['ui_preferences'][key]
+        # Check auto_sort_settings
+        if key in self.config.get('auto_sort_settings', {}):
+            return self.config['auto_sort_settings'][key]
+        # Return default
+        return default if default is not None else self.default_config.get(key)
+
+    def set_setting(self, key, value):
+        """Set a setting value in the appropriate location."""
+        # Check if it belongs in ui_preferences
+        if key in self.default_config.get('ui_preferences', {}):
+            if 'ui_preferences' not in self.config:
+                self.config['ui_preferences'] = {}
+            self.config['ui_preferences'][key] = value
+        # Check if it belongs in auto_sort_settings
+        elif key in self.default_config.get('auto_sort_settings', {}):
+            if 'auto_sort_settings' not in self.config:
+                self.config['auto_sort_settings'] = {}
+            self.config['auto_sort_settings'][key] = value
+        # Otherwise set at top level
+        else:
+            self.config[key] = value
+
     def get_source_folders(self):
         """Get the list of configured source folders."""
         return self.config.get('source_folders', [])

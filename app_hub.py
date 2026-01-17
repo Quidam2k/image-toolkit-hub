@@ -15,114 +15,7 @@ import sys
 import json
 from pathlib import Path
 
-
-class ModernStyle:
-    """Modern color scheme and styling."""
-
-    # Colors - Dark theme with purple accent
-    BG_DARK = "#1a1a2e"
-    BG_CARD = "#16213e"
-    BG_HOVER = "#1f3460"
-    ACCENT = "#7c3aed"
-    ACCENT_HOVER = "#8b5cf6"
-    TEXT = "#e2e8f0"
-    TEXT_DIM = "#94a3b8"
-    TEXT_MUTED = "#64748b"
-    SUCCESS = "#10b981"
-    BORDER = "#334155"
-
-    # Fonts
-    FONT_TITLE = ("Segoe UI", 24, "bold")
-    FONT_HEADING = ("Segoe UI", 14, "bold")
-    FONT_BODY = ("Segoe UI", 11)
-    FONT_SMALL = ("Segoe UI", 9)
-    FONT_ICON = ("Segoe UI", 20)
-
-    @classmethod
-    def apply(cls, root):
-        """Apply modern styling to ttk widgets."""
-        style = ttk.Style(root)
-
-        # Use clam as base - it's the most customizable
-        style.theme_use('clam')
-
-        # Configure colors
-        style.configure(".",
-            background=cls.BG_DARK,
-            foreground=cls.TEXT,
-            font=cls.FONT_BODY
-        )
-
-        # Frame styles
-        style.configure("Card.TFrame", background=cls.BG_CARD)
-        style.configure("Dark.TFrame", background=cls.BG_DARK)
-
-        # Label styles
-        style.configure("Title.TLabel",
-            background=cls.BG_DARK,
-            foreground=cls.TEXT,
-            font=cls.FONT_TITLE
-        )
-        style.configure("Heading.TLabel",
-            background=cls.BG_CARD,
-            foreground=cls.TEXT,
-            font=cls.FONT_HEADING
-        )
-        style.configure("Body.TLabel",
-            background=cls.BG_CARD,
-            foreground=cls.TEXT_DIM,
-            font=cls.FONT_BODY
-        )
-        style.configure("Muted.TLabel",
-            background=cls.BG_DARK,
-            foreground=cls.TEXT_MUTED,
-            font=cls.FONT_SMALL
-        )
-        style.configure("Icon.TLabel",
-            background=cls.BG_CARD,
-            foreground=cls.ACCENT,
-            font=cls.FONT_ICON
-        )
-
-        # Button styles
-        style.configure("Accent.TButton",
-            background=cls.ACCENT,
-            foreground=cls.TEXT,
-            font=cls.FONT_BODY,
-            padding=(20, 10)
-        )
-        style.map("Accent.TButton",
-            background=[("active", cls.ACCENT_HOVER)]
-        )
-
-        # Checkbutton - with visible checkmark
-        style.configure("TCheckbutton",
-            background=cls.BG_CARD,
-            foreground=cls.TEXT,
-            indicatorbackground=cls.BG_DARK,
-            indicatorforeground=cls.SUCCESS,  # Green checkmark
-            indicatorcolor=cls.BG_DARK
-        )
-        style.map("TCheckbutton",
-            indicatorcolor=[
-                ("selected", cls.SUCCESS),  # Green when checked
-                ("!selected", cls.BG_DARK)  # Dark when unchecked
-            ],
-            background=[
-                ("active", cls.BG_HOVER)
-            ]
-        )
-
-        # LabelFrame
-        style.configure("Card.TLabelframe",
-            background=cls.BG_CARD,
-            foreground=cls.TEXT
-        )
-        style.configure("Card.TLabelframe.Label",
-            background=cls.BG_CARD,
-            foreground=cls.TEXT,
-            font=cls.FONT_HEADING
-        )
+from ui_theme import Theme as ModernStyle
 
 
 class ToolCard(tk.Frame):
@@ -385,8 +278,6 @@ class ImageToolkitHub(tk.Tk):
         super().__init__()
 
         self.title("Image Toolkit")
-        self.geometry("1100x750")
-        self.minsize(900, 650)
         self.configure(bg=ModernStyle.BG_DARK)
 
         # Load configuration
@@ -401,20 +292,127 @@ class ImageToolkitHub(tk.Tk):
         # Build UI
         self.setup_ui()
 
-        # Center window
-        self.center_window()
+        # Auto-size window to fit content, then center
+        self.auto_size_window()
 
         # Check for interrupted operations after a short delay (let UI settle)
         self.after(500, self.check_interrupted_operations)
 
-    def center_window(self):
-        """Center the window on screen."""
+    def auto_size_window(self):
+        """Auto-size window to fit content, then center on screen."""
         self.update_idletasks()
-        w = self.winfo_width()
-        h = self.winfo_height()
-        x = (self.winfo_screenwidth() // 2) - (w // 2)
-        y = (self.winfo_screenheight() // 2) - (h // 2)
-        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Get required size from content
+        req_width = self.winfo_reqwidth()
+        req_height = self.winfo_reqheight()
+
+        # Add padding and set reasonable minimums
+        width = max(1000, req_width + 60)
+        height = max(700, req_height + 60)
+
+        # Cap at 90% of screen size
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        width = min(width, int(screen_w * 0.9))
+        height = min(height, int(screen_h * 0.9))
+
+        # Set minimum size
+        self.minsize(900, 700)
+
+        # Center on screen
+        x = (screen_w - width) // 2
+        y = (screen_h - height) // 2
+
+        self.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+
+    def create_settings_panel(self, parent):
+        """Create the grid settings panel."""
+        from config_manager import ConfigManager
+        self.settings_config = ConfigManager()
+
+        # Settings card
+        settings_card = tk.Frame(parent, bg=ModernStyle.BG_CARD,
+            highlightthickness=1, highlightbackground=ModernStyle.BORDER)
+        settings_card.pack(fill="x", pady=(15, 0))
+
+        inner = tk.Frame(settings_card, bg=ModernStyle.BG_CARD, padx=15, pady=12)
+        inner.pack(fill="x")
+
+        # Header
+        tk.Label(inner,
+            text="Grid Settings",
+            font=ModernStyle.FONT_HEADING,
+            fg=ModernStyle.TEXT,
+            bg=ModernStyle.BG_CARD
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Grid rows
+        rows_frame = tk.Frame(inner, bg=ModernStyle.BG_CARD)
+        rows_frame.pack(fill="x", pady=(0, 8))
+
+        tk.Label(rows_frame,
+            text="Grid rows:",
+            font=ModernStyle.FONT_SMALL,
+            fg=ModernStyle.TEXT_DIM,
+            bg=ModernStyle.BG_CARD
+        ).pack(side="left")
+
+        self.rows_var = tk.IntVar(value=self.settings_config.get_setting('num_rows', 3))
+        rows_spin = tk.Spinbox(rows_frame,
+            from_=1, to=10,
+            textvariable=self.rows_var,
+            width=4,
+            font=ModernStyle.FONT_SMALL,
+            bg=ModernStyle.BG_INPUT,
+            fg=ModernStyle.TEXT,
+            buttonbackground=ModernStyle.BG_CARD,
+            command=self.save_settings
+        )
+        rows_spin.pack(side="right")
+        rows_spin.bind('<Return>', lambda e: self.save_settings())
+        rows_spin.bind('<FocusOut>', lambda e: self.save_settings())
+
+        # Checkboxes
+        self.random_var = tk.BooleanVar(value=self.settings_config.get_setting('random_order', True))
+        self.copy_var = tk.BooleanVar(value=self.settings_config.get_setting('copy_instead_of_move', False))
+        self.subfolders_var = tk.BooleanVar(value=self.settings_config.get_setting('include_subfolders', True))
+        self.tagfiles_var = tk.BooleanVar(value=self.settings_config.get_setting('handle_tag_files', True))
+        self.hide_sorted_var = tk.BooleanVar(value=self.settings_config.get_setting('hide_already_sorted', True))
+
+        checkboxes = [
+            (self.random_var, "Randomize order"),
+            (self.copy_var, "Copy mode (don't move)"),
+            (self.subfolders_var, "Include subfolders"),
+            (self.tagfiles_var, "Handle .txt tag files"),
+            (self.hide_sorted_var, "Hide already-sorted"),
+        ]
+
+        for var, text in checkboxes:
+            cb = tk.Checkbutton(inner,
+                text=text,
+                variable=var,
+                font=ModernStyle.FONT_SMALL,
+                fg=ModernStyle.TEXT_DIM,
+                bg=ModernStyle.BG_CARD,
+                activebackground=ModernStyle.BG_CARD,
+                activeforeground=ModernStyle.TEXT,
+                selectcolor=ModernStyle.BG_PRIMARY,
+                command=self.save_settings
+            )
+            cb.pack(anchor="w", pady=1)
+
+    def save_settings(self):
+        """Save settings to config."""
+        try:
+            self.settings_config.set_setting('num_rows', self.rows_var.get())
+            self.settings_config.set_setting('random_order', self.random_var.get())
+            self.settings_config.set_setting('copy_instead_of_move', self.copy_var.get())
+            self.settings_config.set_setting('include_subfolders', self.subfolders_var.get())
+            self.settings_config.set_setting('handle_tag_files', self.tagfiles_var.get())
+            self.settings_config.set_setting('hide_already_sorted', self.hide_sorted_var.get())
+            self.settings_config.save_config()
+        except Exception as e:
+            print(f"Error saving settings: {e}")
 
     def load_config(self):
         """Load hub configuration."""
@@ -537,6 +535,27 @@ class ImageToolkitHub(tk.Tk):
         sort_grid.columnconfigure(0, weight=1)
         sort_grid.columnconfigure(1, weight=1)
 
+        # Section: Ranking & Quality
+        tk.Label(left,
+            text="RANKING & QUALITY",
+            font=("Segoe UI", 10, "bold"),
+            fg=ModernStyle.TEXT_MUTED,
+            bg=ModernStyle.BG_DARK
+        ).pack(anchor="w", pady=(0, 10))
+
+        rank_grid = tk.Frame(left, bg=ModernStyle.BG_DARK)
+        rank_grid.pack(fill="x", pady=(0, 25))
+
+        ToolCard(rank_grid,
+            icon="🏆",
+            title="Image Ranker",
+            description="Pairwise comparison to find your best images using OpenSkill algorithm",
+            command=self.launch_image_ranker
+        ).grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+
+        rank_grid.columnconfigure(0, weight=1)
+        rank_grid.columnconfigure(1, weight=1)
+
         # Section: Data Tools
         tk.Label(left,
             text="DATA & EXPORT",
@@ -565,31 +584,34 @@ class ImageToolkitHub(tk.Tk):
         data_grid.columnconfigure(0, weight=1)
         data_grid.columnconfigure(1, weight=1)
 
-        # Right column - Source folders
-        right = tk.Frame(content, bg=ModernStyle.BG_DARK, width=280)
+        # Right column - Source folders and settings
+        right = tk.Frame(content, bg=ModernStyle.BG_DARK, width=300)
         right.pack(side="right", fill="y", padx=(25, 0))
         right.pack_propagate(False)
 
         # Source folders panel
         self.folder_panel = SourceFolderPanel(right, self)
-        self.folder_panel.pack(fill="both", expand=True)
+        self.folder_panel.pack(fill="x")
         self.folder_panel.configure(highlightthickness=1, highlightbackground=ModernStyle.BORDER)
 
-        # Settings link at bottom of folders panel
-        settings_frame = tk.Frame(right, bg=ModernStyle.BG_DARK)
-        settings_frame.pack(fill="x", pady=(15, 0))
+        # Settings panel
+        self.create_settings_panel(right)
 
-        settings_link = tk.Label(settings_frame,
+        # Quick links at bottom
+        links_frame = tk.Frame(right, bg=ModernStyle.BG_DARK)
+        links_frame.pack(fill="x", pady=(15, 0))
+
+        term_link = tk.Label(links_frame,
             text="⚙️ Term Manager",
             font=ModernStyle.FONT_SMALL,
             fg=ModernStyle.TEXT_DIM,
             bg=ModernStyle.BG_DARK,
             cursor="hand2"
         )
-        settings_link.pack(anchor="w")
-        settings_link.bind("<Button-1>", lambda e: self.launch_term_manager())
-        settings_link.bind("<Enter>", lambda e: settings_link.configure(fg=ModernStyle.ACCENT))
-        settings_link.bind("<Leave>", lambda e: settings_link.configure(fg=ModernStyle.TEXT_DIM))
+        term_link.pack(anchor="w")
+        term_link.bind("<Button-1>", lambda e: self.launch_term_manager())
+        term_link.bind("<Enter>", lambda e: term_link.configure(fg=ModernStyle.ACCENT))
+        term_link.bind("<Leave>", lambda e: term_link.configure(fg=ModernStyle.TEXT_DIM))
 
         # Footer
         footer = tk.Frame(main, bg=ModernStyle.BG_DARK)
@@ -752,6 +774,21 @@ class ImageToolkitHub(tk.Tk):
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to launch term manager:\n{e}")
+
+    def launch_image_ranker(self):
+        """Launch the image ranker tool."""
+        try:
+            from config_manager import ConfigManager
+            from image_ranker_dialog import ImageRankerDialog
+
+            config_manager = ConfigManager()
+            config_manager.config['source_folders'] = self.source_folders
+            config_manager.config['active_sources'] = self.active_sources
+
+            ImageRankerDialog(self, config_manager)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to launch image ranker:\n{e}")
 
     def check_interrupted_operations(self):
         """Check for and offer to resume interrupted copy operations."""
