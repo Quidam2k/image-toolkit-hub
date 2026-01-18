@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from ui_theme import Theme as ModernStyle
+import toast_manager
 
 
 class ToolCard(tk.Frame):
@@ -288,6 +289,9 @@ class ImageToolkitHub(tk.Tk):
 
         # Apply styling
         ModernStyle.apply(self)
+
+        # Initialize toast notifications
+        self.toast = toast_manager.init(self)
 
         # Build UI
         self.setup_ui()

@@ -22,6 +22,8 @@ import os
 import json
 import shutil
 import glob
+import copy
+import threading
 from datetime import datetime
 from configparser import ConfigParser
 import logging
@@ -46,7 +48,11 @@ class ConfigManager:
         self.config_file = config_file
         self.legacy_config_file = legacy_config_file
         self.logger = logging.getLogger(__name__)
-        
+
+        # Thread-safe lock for configuration access
+        # Use RLock to allow nested locking (same thread can acquire multiple times)
+        self._lock = threading.RLock()
+
         self.default_config = {
             'config_version': self.CURRENT_VERSION,
             'source_folders': [],
@@ -233,23 +239,24 @@ class ConfigManager:
             self.logger.info("Migrated existing terms to include new search scope fields")
     
     def save_config(self):
-        """Save configuration with automatic backup."""
-        try:
-            # Create backup if config exists
-            if os.path.exists(self.config_file):
-                self.backup_config()
-            
-            # Add version and timestamp
-            self.config['config_version'] = self.CURRENT_VERSION
-            self.config['last_saved'] = datetime.now().isoformat()
-            
-            # Save configuration
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config, f, indent=2)
-                
-        except Exception as e:
-            self.logger.error(f"Error saving config: {e}")
-            raise
+        """Save configuration with automatic backup (thread-safe)."""
+        with self._lock:
+            try:
+                # Create backup if config exists
+                if os.path.exists(self.config_file):
+                    self.backup_config()
+
+                # Add version and timestamp
+                self.config['config_version'] = self.CURRENT_VERSION
+                self.config['last_saved'] = datetime.now().isoformat()
+
+                # Save configuration
+                with open(self.config_file, 'w') as f:
+                    json.dump(self.config, f, indent=2)
+
+            except Exception as e:
+                self.logger.error(f"Error saving config: {e}")
+                raise
     
     def backup_config(self):
         """Create a backup of the current configuration."""
@@ -370,8 +377,10 @@ class ConfigManager:
             os.makedirs(unmatched_folder, exist_ok=True)
     
     def get_auto_sort_terms(self):
-        """Get list of auto-sort terms with their settings."""
-        return self.config.get('auto_sort_terms', [])
+        """Get list of auto-sort terms with their settings (thread-safe)."""
+        with self._lock:
+            # Return a deep copy to prevent external modification
+            return copy.deepcopy(self.config.get('auto_sort_terms', []))
     
     def add_auto_sort_term(self, term, **kwargs):
         """Add a new auto-sort term."""
@@ -421,8 +430,9 @@ class ConfigManager:
         self.save_config()
     
     def get_auto_sort_settings(self):
-        """Get auto-sort configuration settings."""
-        return self.config.get('auto_sort_settings', {})
+        """Get auto-sort configuration settings (thread-safe)."""
+        with self._lock:
+            return copy.deepcopy(self.config.get('auto_sort_settings', {}))
     
     def update_auto_sort_settings(self, **kwargs):
         """Update auto-sort settings."""
@@ -601,8 +611,9 @@ class ConfigManager:
             return os.path.join(source_folder, folder_name)
     
     def get_multi_tag_mode(self):
-        """Get the current multi-tag sorting mode."""
-        return self.config.get('auto_sort_settings', {}).get('multi_tag_mode', 'single_folder')
+        """Get the current multi-tag sorting mode (thread-safe)."""
+        with self._lock:
+            return self.config.get('auto_sort_settings', {}).get('multi_tag_mode', 'single_folder')
     
     def is_multi_folder_enabled(self):
         """Check if multi-folder copying is enabled."""

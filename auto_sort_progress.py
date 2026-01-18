@@ -3,6 +3,9 @@ from tkinter import ttk
 import threading
 import time
 
+import toast_manager
+
+
 class AutoSortProgressDialog(tk.Toplevel):
     """Progress dialog for auto-sort operations."""
     
@@ -210,20 +213,30 @@ class AutoSortProgressDialog(tk.Toplevel):
         self.pause_button.config(state="disabled")
         self.set_status("Cancelling...")
     
-    def operation_completed(self, success=True, message=""):
+    def operation_completed(self, success=True, message="", stats=None):
         """Mark operation as completed."""
         self.pause_button.config(state="disabled")
         self.cancel_button.config(state="disabled")
         self.close_button.config(state="normal")
-        
+
         if success:
             self.set_status("Completed successfully")
             self.progress_var.set(100)
+
+            # Show toast notification with stats if available
+            if stats:
+                sorted_count = stats.get('sorted', 0)
+                folder_count = len(stats.get('term_counts', {}))
+                toast_msg = f"{sorted_count} images sorted to {folder_count} folders"
+            else:
+                toast_msg = ""
+            toast_manager.show_success(f"{self.operation_name} Complete", toast_msg)
         else:
             self.set_status(f"Failed: {message}" if message else "Operation failed")
-        
+            toast_manager.show_error(f"{self.operation_name} Failed", message)
+
         self.file_label.config(text="")
-        
+
         # Auto-close after a delay if successful
         if success:
             self.after(3000, self.auto_close)

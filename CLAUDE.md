@@ -431,9 +431,65 @@ Proposed solutions in the plan:
 - Shared `ui_theme.py` module (single source of truth)
 - Optional single-window architecture with tabs/modes instead of modals
 
+## Toast Notifications (January 2026)
+
+Non-blocking toast notifications that appear in the bottom-right corner for operation feedback.
+
+### Key Files
+- `toast_manager.py` - ToastManager class and global convenience functions
+
+### Usage
+```python
+import toast_manager
+
+# Initialize once with root window
+toast_manager.init(root)
+
+# Show notifications from anywhere
+toast_manager.show_success("Auto-sort Complete", "847 images sorted")
+toast_manager.show_error("Export Failed", "Insufficient disk space")
+toast_manager.show_warning("Low Disk Space", "Only 2GB remaining")
+toast_manager.show_info("Processing", "Tag embedding in progress")
+```
+
+### Features
+- Auto-dismiss after configurable timeout (default 5s, errors 8s)
+- Click to dismiss immediately
+- Stacks vertically when multiple toasts active
+- Themed to match application (uses ui_theme.py colors)
+
+## Shared Utilities (January 2026)
+
+### file_ops.py
+Centralized file operations for handling images with companion files (.txt, .json, etc.).
+
+```python
+from file_ops import move_with_companions, copy_with_companions, check_disk_space
+
+# Move/copy image AND its companion files together
+move_with_companions(src, dst)
+copy_with_companions(src, dst)
+
+# Check disk space before batch operations
+success, error = check_disk_space(file_list, destination)
+```
+
+## Future Feature Ideas
+
+**See: `docs/POTENTIAL_FEATURES.md`**
+
+A living document of feature ideas organized by category and effort level. Includes:
+- AI-powered features (semantic search, find similar, galaxy view)
+- Workflow improvements (quick look, context menus, drag-and-drop)
+- Accessibility options (workspace profiles, high-contrast modes)
+
 ---
 
 Last Updated: January 17, 2026
+- **Toast notifications**: Non-blocking notifications for operation completion/errors
+- **Thread-safe ConfigManager**: Added locking for safe access during background operations
+- **Shared file_ops module**: Centralized companion file handling
+- **Potential features document**: docs/POTENTIAL_FEATURES.md for tracking ideas
 - **Image Ranker multi-project support**: Separate ranking databases per project, dropdown selector, New/Save As buttons
 - **Image Ranker performance fix**: Fixed 26k image slowdown - was doing 26k filesystem checks per pair, now only checks 2
 - **Grid sorter bug fix**: Fixed preloaded images being silently discarded when rows were full (caused image count to drop by hundreds on page navigation)

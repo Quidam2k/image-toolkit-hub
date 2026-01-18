@@ -19,6 +19,8 @@ from datetime import datetime
 from typing import List, Callable, Optional, Dict
 import time
 
+from file_ops import copy_with_companions, get_companion_files
+
 logger = logging.getLogger(__name__)
 
 
@@ -121,18 +123,23 @@ class BatchExporter:
                         dst = self._get_unique_path(dst)
 
                     if mode == 'copy':
-                        shutil.copy2(src, dst)
+                        # Use copy_with_companions to include .txt tag files etc.
+                        copy_with_companions(str(src), str(dst), handle_conflicts=False)
                     else:  # symlink
                         # Create relative symlink on Windows
                         try:
                             os.symlink(src, dst)
+                            # Also symlink companion files
+                            for companion in get_companion_files(str(src)):
+                                comp_ext = os.path.splitext(companion)[1]
+                                os.symlink(companion, str(dst) + comp_ext)
                         except OSError:
                             # Fallback: try absolute symlink
                             try:
                                 os.symlink(src.absolute(), dst)
                             except OSError as e:
                                 logger.warning(f"Symlink failed for {src}: {e}, copying instead")
-                                shutil.copy2(src, dst)
+                                copy_with_companions(str(src), str(dst), handle_conflicts=False)
 
                     if src.exists():
                         result['total_size'] += src.stat().st_size

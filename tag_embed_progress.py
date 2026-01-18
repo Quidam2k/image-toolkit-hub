@@ -3,6 +3,9 @@ from tkinter import ttk
 import threading
 import time
 
+import toast_manager
+
+
 class TagEmbedProgressDialog(tk.Toplevel):
     """Progress dialog for tag embedding operations."""
     
@@ -221,13 +224,20 @@ class TagEmbedProgressDialog(tk.Toplevel):
         self.pause_button.config(state="disabled")
         self.cancel_button.config(state="disabled")
         
-    def operation_complete(self):
+    def operation_complete(self, stats=None):
         """Called when the operation is complete."""
         self.pause_button.config(state="disabled")
         self.cancel_button.config(state="disabled")
         self.close_button.config(state="normal")
         self.progress_label.config(text="Operation complete!")
-        
+
+        # Show toast notification
+        if stats:
+            embedded = stats.get('embedded', 0)
+            toast_manager.show_success("Tag Embedding Complete", f"{embedded} images processed")
+        else:
+            toast_manager.show_success("Tag Embedding Complete")
+
         # Allow normal window closing
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         
