@@ -41,6 +41,8 @@ import sys
 import shutil
 import random
 import time
+import json
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk
@@ -69,6 +71,9 @@ from auto_sort_confirm import show_auto_sort_confirm
 from batch_export_dialog import show_batch_export_dialog
 from visual_sort_dialog import show_visual_sort_dialog
 from background_sort_dialog import show_background_sort_dialog
+import toast_manager
+import thumb_cache
+from render_brief_dialog import ask_render_brief
 
 # Configure application logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -169,13 +174,114 @@ def get_already_sorted_filenames(destination_folders):
     
     return sorted_filenames
 
-class ImageSorter(tk.Tk):
+class _HoverTip:
+    """Borderless tooltip that follows the cursor over the image grid.
+
+    Used for hover prompts: the status bar can only hold one line, but ComfyUI
+    prompts are long and multi-line, so the full text lives here instead of
+    growing the bottom bar and squeezing the canvas.
+    """
+
+    BG = '#1e1e1e'
+    FG = '#e6e6e6'
+    BORDER = '#4a4a4a'
+    GAP = 6       # space between the hovered image and the tip
+    MARGIN = 8    # keep this far clear of the screen edges
+
+    def __init__(self, master):
+        self.master = master
+        self.tip = None
+        self.label = None
+
+    def _build(self):
+        self.tip = tk.Toplevel(self.master)
+        self.tip.withdraw()
+        self.tip.overrideredirect(True)
+        try:
+            self.tip.attributes('-topmost', True)
+        except tk.TclError:
+            pass
+        self.tip.configure(bg=self.BORDER)
+        self.label = tk.Label(
+            self.tip, text='', justify=tk.LEFT, wraplength=460,
+            font=("Segoe UI", 9), bg=self.BG, fg=self.FG,
+            padx=8, pady=5, anchor='w'
+        )
+        # 1px padding on the black frame gives the thin border.
+        self.label.pack(padx=1, pady=1)
+
+    def show(self, text, rect):
+        try:
+            if self.tip is None or not self.tip.winfo_exists():
+                self._build()
+            self.label.config(text=text)
+            self.tip.deiconify()
+            self.place(rect)
+        except tk.TclError:
+            self.tip = None
+
+    def place(self, rect):
+        """Park the tip beside the hovered image, never on top of it.
+
+        ``rect`` is the hovered image's screen-coordinate bbox. The tip lands in
+        the neighbouring cell - right first, then left, then below/above - so it
+        stays within a glance of the cursor while the image being judged is
+        left fully visible.
+        """
+        if self.tip is None:
+            return
+        try:
+            self.tip.update_idletasks()
+            width = self.tip.winfo_reqwidth()
+            height = self.tip.winfo_reqheight()
+            screen_w = self.tip.winfo_screenwidth()
+            screen_h = self.tip.winfo_screenheight()
+            left, top, right, bottom = rect
+            margin, gap = self.MARGIN, self.GAP
+
+            y = max(margin, min(top, screen_h - margin - height))
+            if right + gap + width <= screen_w - margin:
+                x = right + gap
+            elif left - gap - width >= margin:
+                x = left - gap - width
+            else:
+                # No room either side: drop it below the image, else above it.
+                x = max(margin, min(left, screen_w - margin - width))
+                if bottom + gap + height <= screen_h - margin:
+                    y = bottom + gap
+                else:
+                    y = max(margin, top - gap - height)
+            self.tip.geometry(f'+{int(x)}+{int(y)}')
+        except tk.TclError:
+            self.tip = None
+
+    def hide(self):
+        if self.tip is None:
+            return
+        try:
+            self.tip.withdraw()
+        except tk.TclError:
+            self.tip = None
+
+    def destroy(self):
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except tk.TclError:
+                pass
+        self.tip = None
+        self.label = None
+
+
+class ImageSorter(tk.Frame):
     """
     Main application class for the Enhanced Image Grid Sorter.
-    
-    This class provides a full-screen grid interface for viewing and sorting images
-    with both manual and automatic sorting capabilities. Inherits from tk.Tk to
-    provide the main application window.
+
+    This class provides a grid interface for viewing and sorting images with both
+    manual and automatic sorting capabilities. It is a tk.Frame so it can either
+    be embedded as a panel inside the Image Toolkit Hub (pass a ``hub`` instance)
+    or run standalone inside a throwaway ``tk.Tk`` root (pass ``hub=None`` — see
+    the ``__main__`` wrapper at the bottom of this file).
     
     Key Components:
     - Grid-based image display with configurable rows/columns
@@ -200,9 +306,35 @@ class ImageSorter(tk.Tk):
         stats: Operation statistics tracking
     """
     
-    def __init__(self, folder, num_rows, random_order, copy_instead_of_move):
-        super().__init__()
-        
+    def __init__(self, parent, hub, folder, num_rows, random_order, copy_instead_of_move):
+        super().__init__(parent)
+
+        # Reference to the Image Toolkit Hub when embedded as a panel; None when
+        # running standalone. Window operations (title, fullscreen, exit) and
+        # event bindings are routed based on this (see the _update_title,
+        # _is_fullscreen, activate/deactivate helpers below).
+        self.hub = hub
+
+        # Lazy-sizing + cleanup state. The grid can't be sized until the frame
+        # has real allocated dimensions, so sizing/initial-load is deferred to
+        # the first <Configure> event (see _on_frame_configure). The after()
+        # id lets deactivate() cancel a pending background-loading check.
+        self._sizing_done = False
+        self._check_bg_after_id = None
+        self._key_bindings = {}
+
+        # Reflow state: <Configure> stays bound after the first sizing so the
+        # grid re-lays out when the frame's allocated size changes (hub chrome
+        # collapsing/expanding, window resize). _last_grid_size filters out the
+        # move-only <Configure>s Tk also emits; the after() id debounces the
+        # burst of events a window drag produces.
+        self._reflow_after_id = None
+        self._last_grid_size = (0, 0)
+        # Enter/PageDown keep + render: pending H3 jobs are re-sent on a timer
+        # until Comfy answers (h3_sorter_queue, imported on first use).
+        self._h3_pump_after_id = None
+        self._h3_queue = None
+
         # Initialize configuration manager
         self.config_manager = ConfigManager()
         
@@ -214,6 +346,17 @@ class ImageSorter(tk.Tk):
 
         # Track last operation for status display
         self.last_operation_message = ""
+
+        # Hover-prompt state: the file the cursor is over, so <Motion> only
+        # re-parses metadata when it changes (otherwise it just moves the tip).
+        self._hover_prompt_file = None
+        self._hover_tip = None
+        self._hover_tip_after_id = None
+        self._hover_tip_visible = False
+        self._hover_tip_delay_ms = self._load_hover_tip_delay()
+        # Where accumulated "use more" / "use less" prompt lists are written
+        # (both JSON for automation and TXT for hand editing).
+        self._prompt_lists_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
         
         # Basic settings - support multiple source folders
         self.folder = folder  # Primary folder for backward compatibility
@@ -245,6 +388,10 @@ class ImageSorter(tk.Tk):
         self.background_loading = False
         self.background_load_target = 150  # Target number of images to preload
         self.background_load_thread = None
+
+        # Persistent thumbnail/dimension cache (data/thumb_cache/): trim to its
+        # size cap in the background so startup never waits on it.
+        thumb_cache.get_cache().prune_async()
         
         # Image tracking for better counting
         self.skipped_images = []  # Track images that couldn't be loaded
@@ -268,69 +415,151 @@ class ImageSorter(tk.Tk):
         self.setup_ui()
         self.setup_menu()
         self.setup_auto_sort_toolbar()
-        
-        # Load images if we have source folders configured
-        if self.source_folders:
-            self.load_initial_images()
-        else:
-            # Show welcome message if no sources are configured
-            self.show_welcome_message()
+
+        # NOTE: the initial image load is intentionally deferred to
+        # _on_frame_configure() (triggered by the first real <Configure>) so the
+        # grid sizes to the frame's actual allocated dimensions rather than a
+        # placeholder width of 1. Standalone use calls activate() which also
+        # nudges sizing if the frame is already mapped.
 
     def load_key_bindings(self):
         """Load key bindings from config manager."""
         self.bindings = self.config_manager.get_bindings()
     
+    def _update_title(self, text):
+        """Route a title/status string to the hub status bar (embedded) or the
+        toplevel window title (standalone)."""
+        if self.hub is not None:
+            self.hub.set_status(text)
+        else:
+            self.winfo_toplevel().title(text)
+
+    def _is_fullscreen(self):
+        """True only in standalone mode when the toplevel is fullscreen.
+
+        When embedded there is no fullscreen concept for the panel, so grid
+        sizing always uses the frame's allocated dimensions.
+        """
+        return self.hub is None and bool(self.winfo_toplevel().attributes('-fullscreen'))
+
     def setup_ui(self):
-        """Set up the main user interface."""
-        self.title('Enhanced Image Sorter')
-        self.state('zoomed')
-        self.attributes('-fullscreen', True)
-        
+        """Set up the main user interface.
+
+        Keyboard/mouse bindings and grid sizing are deliberately NOT done here:
+        - Bindings are attached in activate() / detached in deactivate() so they
+          only fire while this panel is the active one (avoids the embedded
+          sidebar/rail stealing sort clicks).
+        - Grid dimensions are computed lazily in _on_frame_configure() from the
+          real allocated size (winfo_width is 1 until the frame is mapped).
+        """
         # Create main container
         self.main_container = tk.Frame(self)
         self.main_container.pack(fill=tk.BOTH, expand=True)
-        
-        # Set up keyboard bindings
-        self.bind('<Escape>', self.handle_key_binding)
-        self.bind('<F11>', self.toggle_fullscreen)  # F11 to toggle fullscreen
-        self.bind('1', self.handle_key_binding)
-        self.bind('2', self.handle_key_binding)
-        self.bind('3', self.handle_key_binding)
-        self.bind('<space>', self.handle_key_binding)
-        self.bind('r', self.handle_key_binding)
-        self.bind('R', self.launch_ranker_for_category1)  # Shift+R opens ranker for sorted folder 1
-        self.bind('<Control-a>', self.auto_sort_all)
-        self.bind('<Control-t>', self.open_term_manager)
-        self.bind('<Control-z>', lambda e: self.undo_last_operation())
-        self.bind('<Control-Shift-z>', lambda e: self.redo_operation())
 
-        # Set up mouse bindings
-        self.bind('<Button-1>', self.handle_mouse_binding)
-        self.bind('<Button-2>', self.handle_mouse_binding)
-        self.bind('<Button-3>', self.handle_mouse_binding)
-        self.bind('<Button-4>', self.handle_mouse_binding)
-        self.bind('<Button-5>', self.handle_mouse_binding)
-        
-        self.update_idletasks()
-        
-        # Calculate available space dynamically
-        if self.attributes('-fullscreen'):
+        # Placeholder dimensions; real values are computed in
+        # _on_frame_configure() once the frame has been mapped and sized.
+        self.screen_width = 1
+        self.screen_height = 1
+        self.row_height = 100
+        self.bind('<Configure>', self._on_frame_configure)
+
+        # Create a canvas with a dark gray background for better contrast
+        self.canvas = tk.Canvas(self.main_container, bg='#2d2d2d', highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Add status bar at bottom
+        self.setup_status_bar()
+
+    def _on_frame_configure(self, event):
+        """Size the grid on the first real <Configure>, reflow on later ones.
+
+        An embedded frame reports winfo_width()==1 until it is mapped, which
+        would break the grid fill math, so we wait for a real size before
+        computing dimensions and kicking off the initial image load. After
+        that the binding stays live: the hub chrome can collapse/expand (or the
+        window can be resized) mid-sort, which changes the frame's allocated
+        size and means the grid has to be re-measured and re-laid out.
+        """
+        if event.width <= 1:
+            return
+
+        if not self._sizing_done:
+            self._perform_sizing()
+            return
+
+        size = (event.width, event.height)
+        if size == self._last_grid_size:
+            return  # Tk emits <Configure> for moves too; nothing to redo.
+        self._last_grid_size = size
+        self._schedule_reflow()
+
+    def _measure_grid(self):
+        """Set screen_width/screen_height/row_height from the current geometry.
+
+        In standalone fullscreen the grid fills the physical screen; otherwise
+        it fills the frame's allocated size (the embedded panel case).
+        """
+        if self._is_fullscreen():
             self.screen_width = self.winfo_screenwidth()
             self.screen_height = self.winfo_screenheight()
             available_height = self.screen_height - 80  # Account for toolbar
         else:
             self.screen_width = self.winfo_width()
             self.screen_height = self.winfo_height()
-            available_height = self.screen_height - 120  # Account for toolbar + menu + title bar
-        
-        self.row_height = available_height // self.num_rows
+            available_height = self.screen_height - 120  # Toolbar + status bar
 
-        # Create a canvas with a dark gray background for better contrast
-        self.canvas = tk.Canvas(self.main_container, bg='#2d2d2d')
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.row_height = max(1, available_height // self.num_rows)
 
-        # Add status bar at bottom
-        self.setup_status_bar()
+    def _perform_sizing(self):
+        """Compute grid dimensions and trigger the initial image load (once)."""
+        if self._sizing_done:
+            return
+        width = self.winfo_width()
+        if width <= 1:
+            return
+        self._sizing_done = True
+
+        self._measure_grid()
+        self._last_grid_size = (width, self.winfo_height())
+
+        # Now that the grid is sized, perform the deferred initial load.
+        if self.source_folders:
+            self.load_initial_images()
+        else:
+            self.show_welcome_message()
+
+    def _schedule_reflow(self):
+        """Debounce reflows; a window drag emits a burst of <Configure>s and
+        every reload re-decodes the visible images."""
+        if self._reflow_after_id is not None:
+            try:
+                self.after_cancel(self._reflow_after_id)
+            except tk.TclError:
+                pass
+        self._reflow_after_id = self.after(250, self._reflow_grid)
+
+    def _reflow_grid(self):
+        """Re-measure the frame and re-lay out whatever is on screen."""
+        self._reflow_after_id = None
+
+        # Don't fight an in-flight load_batch; try again once it settles.
+        if self.is_loading:
+            self._schedule_reflow()
+            return
+
+        if self.winfo_width() <= 1:
+            return
+
+        before = (self.screen_width, self.screen_height, self.row_height)
+        self._measure_grid()
+        if (self.screen_width, self.screen_height, self.row_height) == before:
+            return
+
+        if self.current_batch:
+            self._reload_current_batch()
+        elif not self.source_folders:
+            # Welcome screen draws from screen_width/screen_height.
+            self.show_welcome_message()
 
     def setup_status_bar(self):
         """Set up the status bar at the bottom of the window."""
@@ -379,11 +608,16 @@ class ImageSorter(tk.Tk):
         self.update_idletasks()
 
     def setup_menu(self):
-        """Set up the menu bar."""
-        # Don't use overrideredirect - keep fullscreen but add menu
-        menubar = tk.Menu(self)
-        self.config(menu=menubar)
-        
+        """Build the menu bar against the toplevel WITHOUT attaching it.
+
+        A tk.Frame can't host a menubar, so the menubar is built against the
+        toplevel window and stored on self.menubar. activate() attaches it via
+        toplevel.config(menu=...) and deactivate() swaps in an empty menu, so
+        the menubar is only present while this panel is active.
+        """
+        menubar = tk.Menu(self.winfo_toplevel())
+        self.menubar = menubar
+
         # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -394,7 +628,9 @@ class ImageSorter(tk.Tk):
         file_menu.add_command(label="Collect Unmatched Images...", command=self.collect_unmatched_images)
         file_menu.add_command(label="Term Manager...", command=self.open_term_manager)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.destroy)
+        file_menu.add_command(label="Take Out the Trash...", command=self.take_out_trash)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._exit)
 
         # Edit menu
         edit_menu = tk.Menu(menubar, tearoff=0)
@@ -502,6 +738,130 @@ class ImageSorter(tk.Tk):
         )
         self.stats_label.pack(padx=5, pady=2)
 
+    def activate(self):
+        """Attach event bindings + menubar and take focus.
+
+        Called by the hub when this panel becomes active, and by the standalone
+        __main__ wrapper. Keyboard bindings go on the toplevel (they fire for
+        any descendant with focus); mouse bindings go on the canvas so clicks on
+        the hub sidebar/rail don't trigger sorting.
+        """
+        toplevel = self.winfo_toplevel()
+
+        # Keyboard bindings, scoped so they only fire while this panel is active.
+        self._key_bindings = {
+            '<Escape>': self.handle_key_binding,
+            '<F11>': self.toggle_fullscreen,
+            '1': self.handle_key_binding,
+            '2': self.handle_key_binding,
+            '3': self.handle_key_binding,
+            '<space>': self.handle_key_binding,
+            'r': self.handle_key_binding,
+            'R': self.launch_ranker_for_category1,  # Shift+R opens ranker for folder 1
+            '<Control-a>': self.auto_sort_all,
+            '<Control-t>': self.open_term_manager,
+            '<Control-z>': lambda e: self.undo_last_operation(),
+            '<Control-Shift-z>': lambda e: self.redo_operation(),
+            # Trackball button: keep the hovered image + queue an H3 clip.
+            '<Return>': self.keep_and_render,
+            '<Next>': self.keep_and_render,
+        }
+        for seq, cb in self._key_bindings.items():
+            toplevel.bind(seq, cb)
+
+        # Mouse bindings on the canvas only (avoids sidebar/rail click conflict).
+        for num in (1, 2, 3, 4, 5):
+            self.canvas.bind(f'<Button-{num}>', self.handle_mouse_binding)
+
+        # Hover prompt (status bar) + mousewheel prompt-list capture.
+        self.canvas.bind('<Motion>', self._on_canvas_motion)
+        self.canvas.bind('<Leave>', self._on_canvas_leave)
+        self.canvas.bind('<MouseWheel>', self._on_canvas_mousewheel)
+
+        # Attach the menubar to the toplevel.
+        toplevel.config(menu=self.menubar)
+
+        # Route keyboard events here (the rail Treeview can otherwise hold focus).
+        toplevel.focus_set()
+        self.canvas.focus_set()
+
+        # If the frame is already mapped/sized, make sure the deferred initial
+        # load runs (the <Configure> hook usually handles this on first map).
+        self.after_idle(self._perform_sizing)
+
+        # Send any H3 jobs left pending from an earlier session.
+        self._schedule_h3_pump(5000)
+
+    def deactivate(self):
+        """Detach bindings + menubar and stop background work.
+
+        Called by the hub before tearing down or switching away from this panel.
+        Prevents stray key/mouse events and pending after() timers from firing
+        against a frame that is about to be destroyed.
+        """
+        toplevel = self.winfo_toplevel()
+
+        # Unbind keyboard sequences from the toplevel.
+        for seq in self._key_bindings:
+            try:
+                toplevel.unbind(seq)
+            except tk.TclError:
+                pass
+        self._key_bindings = {}
+
+        # Unbind mouse buttons from the canvas.
+        for num in (1, 2, 3, 4, 5):
+            try:
+                self.canvas.unbind(f'<Button-{num}>')
+            except tk.TclError:
+                pass
+        for seq in ('<Motion>', '<Leave>', '<MouseWheel>'):
+            try:
+                self.canvas.unbind(seq)
+            except tk.TclError:
+                pass
+
+        # Detach the menubar by swapping in an empty one.
+        try:
+            toplevel.config(menu=tk.Menu(toplevel))
+        except tk.TclError:
+            pass
+
+        # Stop the background image-loading thread and cancel its status check.
+        self.background_loading = False
+        if self._check_bg_after_id is not None:
+            try:
+                self.after_cancel(self._check_bg_after_id)
+            except tk.TclError:
+                pass
+            self._check_bg_after_id = None
+
+        if self._h3_pump_after_id is not None:
+            try:
+                self.after_cancel(self._h3_pump_after_id)
+            except tk.TclError:
+                pass
+            self._h3_pump_after_id = None
+
+        # Tear down the hover tooltip (its own Toplevel + pending after()).
+        self._destroy_hover_tip()
+
+        # Cancel a pending reflow so it can't fire against a frame the hub is
+        # about to destroy.
+        if self._reflow_after_id is not None:
+            try:
+                self.after_cancel(self._reflow_after_id)
+            except tk.TclError:
+                pass
+            self._reflow_after_id = None
+
+    def _exit(self):
+        """Exit the sorter: return Home when embedded, destroy root standalone."""
+        if self.hub is not None:
+            self.hub.close_sort_panel()
+        else:
+            self.winfo_toplevel().destroy()
+
     def handle_key_binding(self, event):
         """Handle keyboard events based on the current bindings."""
         key_name = None
@@ -552,7 +912,7 @@ class ImageSorter(tk.Tk):
         elif action == 'reload':
             self.load_initial_images()
         elif action == 'exit':
-            self.destroy()
+            self._exit()
         elif action == 'config':
             self.change_folder(None)
         
@@ -571,6 +931,310 @@ class ImageSorter(tk.Tk):
                     if img_item == item:
                         self.sort_image(None, category, file)
                         return
+
+    def _image_file_under_pointer(self):
+        """Image file under the mouse pointer (canvas coords), or None."""
+        x = self.canvas.canvasx(self.canvas.winfo_pointerx() - self.canvas.winfo_rootx())
+        y = self.canvas.canvasy(self.canvas.winfo_pointery() - self.canvas.winfo_rooty())
+        for item in self.canvas.find_overlapping(x, y, x, y):
+            for img_item, _, file in self.image_labels:
+                if img_item == item:
+                    return file
+        return None
+
+    def keep_and_render(self, event=None, image_file=None):
+        """Enter/PageDown: keep the hovered image (folder 1), then ask for a
+        brief and queue a MiniMax H3 clip of the kept copy. Returns the kept
+        path, or None when nothing was under the pointer."""
+        if self.is_loading:
+            return None
+        image_file = image_file or self._image_file_under_pointer()
+        if not image_file:
+            return None
+        kept = self.sort_image(None, '1', image_file)
+        if not kept:
+            return None
+        ask_render_brief(self, kept,
+                         on_submit=lambda brief: self._queue_h3_render(kept, brief))
+        return kept
+
+    def _h3_bridge(self):
+        """Import h3_sorter_queue from the comfy_workflows repo (config
+        h3_bridge.comfy_workflows_path). Raises ImportError if it is missing."""
+        if self._h3_queue is None:
+            path = self.config_manager.config.get('h3_bridge', {}).get(
+                'comfy_workflows_path', r'Q:\Development\comfy_workflows')
+            if path not in sys.path:
+                sys.path.append(path)
+            import h3_sorter_queue
+            self._h3_queue = h3_sorter_queue
+        return self._h3_queue
+
+    def _queue_h3_render(self, image_file, brief):
+        def work():
+            try:
+                bridge = self._h3_bridge()
+                bridge.enqueue(image_file, brief)
+                result = bridge.pump()
+            except Exception as exc:
+                message = str(exc)
+                self.after(0, lambda: toast_manager.show_error("H3 queue failed", message))
+                return
+            self.after(0, lambda: self._toast_h3_result(result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _toast_h3_result(self, result):
+        pending = result.get('pending', 0)
+        if result.get('sent'):
+            toast_manager.show_success("Queued for H3",
+                                       f"{result['sent']} sent ({pending} pending)")
+        elif result.get('online') is False:
+            toast_manager.show_warning("Comfy offline",
+                                       f"will send when it's up ({pending} pending)")
+        elif result.get('error') and result['error'] != 'busy':
+            toast_manager.show_error("H3 queue", result['error'][:300])
+        else:
+            toast_manager.show_info("Queued for H3", f"{pending} pending")
+
+    def _schedule_h3_pump(self, delay_ms=30000):
+        if self._h3_pump_after_id is not None:
+            try:
+                self.after_cancel(self._h3_pump_after_id)
+            except tk.TclError:
+                pass
+        self._h3_pump_after_id = self.after(delay_ms, self._h3_pump_tick)
+
+    def _h3_pump_tick(self):
+        """Every 30 s: re-send pending H3 jobs (no network when none wait)."""
+        self._h3_pump_after_id = None
+
+        def work():
+            try:
+                result = self._h3_bridge().pump(log=lambda *a, **k: None)
+            except Exception:
+                return
+            if result.get('sent'):
+                self.after(0, lambda: self._toast_h3_result(result))
+
+        threading.Thread(target=work, daemon=True).start()
+        self._schedule_h3_pump(30000)
+
+    def _image_file_at_event(self, event):
+        """Return the image file under an event's cursor, or None."""
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        for item in self.canvas.find_overlapping(x, y, x, y):
+            for img_item, _, file in self.image_labels:
+                if img_item == item:
+                    return file
+        return None
+
+    def _prompt_for_file(self, image_file):
+        """Best-effort prompt text for an image (A1111, ComfyUI, Midjourney, tags)."""
+        try:
+            metadata = self.metadata_parser.extract_metadata(image_file)
+            return self.metadata_parser.get_prompt_text(metadata)[0]
+        except Exception:
+            return ""
+
+    HOVER_TIP_DELAY_MS = 1300     # default dwell before the tooltip appears
+    HOVER_TIP_DELAY_MIN_MS = 0
+    HOVER_TIP_DELAY_MAX_MS = 10000
+    HOVER_TIP_MAX_CHARS = 1200    # cap so one huge prompt can't fill the screen
+    HOVER_STATUS_CHARS = 120      # status bar stays a single row, always
+
+    def _load_hover_tip_delay(self):
+        """Read the hover dwell (ms) from ui_preferences, clamped to sane bounds."""
+        try:
+            value = int(self.config_manager.config.get('ui_preferences', {}).get(
+                'hover_tip_delay_ms', self.HOVER_TIP_DELAY_MS))
+        except (AttributeError, TypeError, ValueError):
+            return self.HOVER_TIP_DELAY_MS
+        return max(self.HOVER_TIP_DELAY_MIN_MS,
+                   min(self.HOVER_TIP_DELAY_MAX_MS, value))
+
+    def apply_hover_tip_delay(self, delay_ms):
+        """Hook for the hub settings panel: change the dwell without a reload."""
+        try:
+            delay_ms = int(delay_ms)
+        except (TypeError, ValueError):
+            return
+        self._hover_tip_delay_ms = max(self.HOVER_TIP_DELAY_MIN_MS,
+                                       min(self.HOVER_TIP_DELAY_MAX_MS, delay_ms))
+
+    def _image_screen_rect(self, image_file):
+        """Screen-coordinate bbox of a displayed image, or None if not placed."""
+        try:
+            item = next((i for i, _, f in self.image_labels if f == image_file), None)
+            if item is None:
+                return None
+            bbox = self.canvas.bbox(item)
+            if not bbox:
+                return None
+            off_x = self.canvas.winfo_rootx() - int(self.canvas.canvasx(0))
+            off_y = self.canvas.winfo_rooty() - int(self.canvas.canvasy(0))
+            return (bbox[0] + off_x, bbox[1] + off_y,
+                    bbox[2] + off_x, bbox[3] + off_y)
+        except (tk.TclError, AttributeError):
+            return None
+
+    def _cancel_hover_tip_timer(self):
+        if self._hover_tip_after_id is not None:
+            try:
+                self.after_cancel(self._hover_tip_after_id)
+            except tk.TclError:
+                pass
+            self._hover_tip_after_id = None
+
+    def _hide_hover_tip(self, reset_file=True):
+        """Take the tooltip down and drop any pending show timer."""
+        self._cancel_hover_tip_timer()
+        if self._hover_tip is not None:
+            self._hover_tip.hide()
+        self._hover_tip_visible = False
+        if reset_file:
+            self._hover_prompt_file = None
+
+    def _destroy_hover_tip(self):
+        self._cancel_hover_tip_timer()
+        if self._hover_tip is not None:
+            self._hover_tip.destroy()
+            self._hover_tip = None
+        self._hover_tip_visible = False
+        self._hover_prompt_file = None
+
+    def _show_hover_tip(self, image_file):
+        """Timer callback: parse the prompt and pop the tooltip at the cursor."""
+        self._hover_tip_after_id = None
+        if self.is_loading or image_file != self._hover_prompt_file:
+            return
+
+        prompt = self._prompt_for_file(image_file)
+        name = os.path.basename(image_file)
+        if not prompt:
+            self.update_status_bar(f"(no prompt) {name}")
+            return
+
+        # Status bar: one line only - newlines collapsed, then truncated, so the
+        # bar can never grow a second row and steal height from the canvas.
+        summary = f"\U0001F4DD {name} - {' '.join(prompt.split())}"
+        if len(summary) > self.HOVER_STATUS_CHARS:
+            summary = summary[:self.HOVER_STATUS_CHARS - 3] + "..."
+        self.update_status_bar(summary)
+
+        text = prompt
+        if len(text) > self.HOVER_TIP_MAX_CHARS:
+            text = text[:self.HOVER_TIP_MAX_CHARS - 3] + "..."
+        if self._hover_tip is None:
+            self._hover_tip = _HoverTip(self)
+        rect = self._image_screen_rect(image_file)
+        if rect is None:
+            # Image scrolled or reflowed away - fall back to the cursor.
+            px, py = self.winfo_pointerx(), self.winfo_pointery()
+            rect = (px, py, px, py)
+        self._hover_tip.show(text, rect)
+        self._hover_tip_visible = True
+
+    def _on_canvas_motion(self, event):
+        """Track the hovered image; show/move a cursor-following prompt tooltip."""
+        if self.is_loading:
+            self._hide_hover_tip()
+            return
+
+        image_file = self._image_file_at_event(event)
+        if image_file == self._hover_prompt_file:
+            # Same image: the tip is anchored to it, so leave it where it is.
+            return
+
+        self._hover_prompt_file = image_file
+        self._hide_hover_tip(reset_file=False)
+        if not image_file:
+            self.update_status_bar("Ready")
+            return
+        self._hover_tip_after_id = self.after(
+            self._hover_tip_delay_ms, lambda f=image_file: self._show_hover_tip(f)
+        )
+
+    def _on_canvas_leave(self, event):
+        """Reset hover state when the cursor leaves the grid."""
+        self._hide_hover_tip()
+        self.update_status_bar("Ready")
+
+    def _on_canvas_mousewheel(self, event):
+        """Wheel up = save hovered prompt to 'use more', wheel down = 'use less'."""
+        if self.is_loading:
+            return
+        self._hide_hover_tip()
+        image_file = self._image_file_at_event(event)
+        if not image_file:
+            return
+        which = 'use_more' if event.delta > 0 else 'use_less'
+        self._save_prompt_to_list(image_file, which)
+
+    def _save_prompt_to_list(self, image_file, which):
+        """Append the image's prompt to the use_more/use_less lists (JSON + TXT).
+
+        De-dupes within a list and moves the entry to the opposite list on a
+        reversal, so the pair always reflects the latest decision for a file.
+        """
+        prompt = self._prompt_for_file(image_file)
+        if not prompt:
+            toast_manager.show_warning("No Prompt", os.path.basename(image_file))
+            self.update_status_bar(f"No prompt to save for {os.path.basename(image_file)}")
+            return
+
+        other = 'use_less' if which == 'use_more' else 'use_more'
+        basename = os.path.basename(image_file)
+        os.makedirs(self._prompt_lists_dir, exist_ok=True)
+
+        # Load current lists (tolerate missing/corrupt files).
+        entries = {}
+        for key in ('use_more', 'use_less'):
+            path = os.path.join(self._prompt_lists_dir, f'prompts_{key}.json')
+            data = []
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = []
+            entries[key] = data if isinstance(data, list) else []
+
+        already = any(e.get('file') == basename for e in entries[which])
+        # Drop this file from the opposite list (reversal) and any stale dupe.
+        entries[other] = [e for e in entries[other] if e.get('file') != basename]
+        if not already:
+            entries[which].append({
+                'file': basename,
+                'path': image_file.replace('\\', '/'),
+                'prompt': prompt,
+                'ts': datetime.now().isoformat(timespec='seconds'),
+            })
+
+        # Persist both lists as JSON and TXT.
+        for key in ('use_more', 'use_less'):
+            json_path = os.path.join(self._prompt_lists_dir, f'prompts_{key}.json')
+            txt_path = os.path.join(self._prompt_lists_dir, f'prompts_{key}.txt')
+            try:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(entries[key], f, indent=2, ensure_ascii=False)
+                with open(txt_path, 'w', encoding='utf-8') as f:
+                    for e in entries[key]:
+                        f.write(f"[{e.get('file', '')}] {e.get('prompt', '')}\n")
+            except Exception as exc:
+                toast_manager.show_error("Save Failed", str(exc))
+                self.update_status_bar(f"Failed to save prompt list: {exc}")
+                return
+
+        label = "Use More" if which == 'use_more' else "Use Less"
+        count = len(entries[which])
+        if already:
+            toast_manager.show_info(f"Already in {label}", f"{basename} ({count} total)")
+            self.update_status_bar(f"Already in {label} list — {basename}")
+        else:
+            toast_manager.show_success(f"Saved to {label}", f"{basename} ({count} total)")
+            self.update_status_bar(f"Saved to {label} list ({count}) — {basename}")
 
     def load_initial_images(self):
         """Load initial set of images from the source folders."""
@@ -631,83 +1295,103 @@ class ImageSorter(tk.Tk):
             self.background_load_thread.start()
             
             # Also schedule a check to restart background loading if needed
-            self.after(5000, self._check_background_loading_status)
+            # (tracked so deactivate() can cancel it before teardown).
+            self._check_bg_after_id = self.after(5000, self._check_background_loading_status)
+
+    def _check_file_size(self, image_file):
+        """Return False (and record the skip) for files too large to load."""
+        file_size = os.path.getsize(image_file)
+        if file_size > 100 * 1024 * 1024:  # Only skip truly enormous files (>100MB)
+            self.skipped_images.append((image_file, "File too large (>100MB)"))
+            return False
+        elif file_size > 50 * 1024 * 1024:  # Warn about large files
+            print(f"Loading large file ({file_size // (1024*1024)}MB): {os.path.basename(image_file)}")
+        return True
+
+    def _display_size(self, image_file):
+        """(width, aspect_ratio) the image will occupy at the current row height.
+
+        Uses the persistent dims cache, so a hit never opens the image file.
+        """
+        width, height = thumb_cache.get_cache().get_dims(image_file)
+        aspect_ratio = width / height
+        return max(1, int(self.row_height * aspect_ratio)), aspect_ratio
+
+    def _load_display_image(self, image_file):
+        """Return (tk_img, width, aspect_ratio) for the grid via the thumb cache."""
+        new_width, aspect_ratio = self._display_size(image_file)
+        resized_img = thumb_cache.get_cache().load_thumb(image_file, self.row_height)
+        tk_img = ImageTk.PhotoImage(resized_img)
+        new_width = resized_img.width
+        resized_img.close()
+        return tk_img, new_width, aspect_ratio
 
     def _background_load_worker(self):
         """Background worker to preload images."""
+        while self.background_loading:
+            self._fill_preload_buffer()
+            # In-memory buffer is full: keep warming the on-disk thumb cache further
+            # down the queue (no PhotoImage, nothing popped) so later pages and the
+            # next launch are hot. Returns early if the buffer drains (page turn).
+            self._warm_disk_cache()
+            if not self.images or len(self.preloaded_images) >= self.background_load_target:
+                break
+
+        self.background_loading = False
+
+    def _fill_preload_buffer(self):
+        """Decode queue-front images into preloaded_images up to the target."""
         batch_size = 10  # Process images in small batches to prevent blocking
-        
+
         while len(self.images) > 0 and len(self.preloaded_images) < self.background_load_target:
             if not self.background_loading:  # Check if we should stop
                 break
-            
+
             # Process a small batch of images
             for _ in range(batch_size):
                 if not self.images or not self.background_loading:
                     break
-                    
+
                 try:
                     # Take the next image from the queue
                     image_file = self.images.pop(0)
-                    
-                    # Quick size check - warn but don't skip, PIL can handle large files
-                    file_size = os.path.getsize(image_file)
-                    if file_size > 100 * 1024 * 1024:  # Only skip truly enormous files (>100MB)
-                        self.skipped_images.append((image_file, "File too large (>100MB)"))
+
+                    if not self._check_file_size(image_file):
                         continue
-                    elif file_size > 50 * 1024 * 1024:  # Warn about large files
-                        print(f"Loading large file ({file_size // (1024*1024)}MB): {os.path.basename(image_file)}")
-                    
-                    # Load and process the image
-                    img = Image.open(image_file)
-                    total_pixels = img.width * img.height
-                    
-                    if total_pixels > 100000000:  # Generate thumbnail for very large images
-                        original_size = f"{img.width}x{img.height}"
-                        print(f"Generating thumbnail for large image: {os.path.basename(image_file)} ({original_size})")
-                        try:
-                            # Create thumbnail - maintains aspect ratio, modifies image in-place
-                            img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
-                            total_pixels = img.width * img.height  # Recalculate after thumbnail
-                            print(f"  Thumbnail created: {original_size} -> {img.width}x{img.height}")
-                        except Exception as thumb_e:
-                            print(f"  Failed to create thumbnail: {thumb_e}")
-                            # If thumbnail fails, skip this image
-                            img.close()
-                            self.skipped_images.append((image_file, f"Thumbnail generation failed: {thumb_e}"))
-                            continue
-                    
-                    # Calculate dimensions
-                    aspect_ratio = img.width / img.height
-                    new_height = self.row_height
-                    new_width = int(new_height * aspect_ratio)
-                    
-                    # Resize image with better quality for background loading
-                    if total_pixels > 25000000:
-                        resized_img = img.resize((new_width, new_height), Image.Resampling.BILINEAR)
-                    elif total_pixels > 10000000:
-                        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    else:
-                        resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    
-                    img.close()
-                    
-                    # Create PhotoImage
-                    tk_img = ImageTk.PhotoImage(resized_img)
-                    resized_img.close()
-                    
+
+                    tk_img, new_width, aspect_ratio = self._load_display_image(image_file)
+
                     # Store preloaded data
                     self.preloaded_images.append((image_file, tk_img, new_width, aspect_ratio))
-                    
+
                 except Exception as e:
                     # Track problematic images
                     self.skipped_images.append((image_file, f"Load error: {str(e)}"))
                     continue
-            
+
             # Small delay to prevent excessive CPU usage
             time.sleep(0.1)
-        
-        self.background_loading = False
+
+    def _warm_disk_cache(self, lookahead=600):
+        """Generate on-disk thumbs for upcoming queue entries. Worker thread only."""
+        cache = thumb_cache.get_cache()
+        if not cache.enabled:
+            return
+        row_height = self.row_height
+        for image_file in list(self.images[:lookahead]):
+            if not self.background_loading or self.row_height != row_height:
+                return
+            # The buffer drained (page turn): go back to filling it first.
+            if len(self.preloaded_images) < self.background_load_target:
+                return
+            try:
+                if cache.has_thumb(image_file, row_height):
+                    continue
+                if os.path.getsize(image_file) > 100 * 1024 * 1024:
+                    continue
+                cache.load_thumb(image_file, row_height).close()
+            except Exception:
+                continue  # Surfaces properly when the image is actually loaded
 
     def stop_background_loading(self):
         """Stop background loading."""
@@ -715,14 +1399,17 @@ class ImageSorter(tk.Tk):
 
     def _check_background_loading_status(self):
         """Check if background loading should be restarted."""
+        # This timer just fired; clear its id before deciding whether to reschedule.
+        self._check_bg_after_id = None
         if not self.background_loading and len(self.images) > 0 and len(self.preloaded_images) < self.background_load_target:
             self.start_background_loading()
         elif len(self.images) > 0:
             # Schedule another check
-            self.after(5000, self._check_background_loading_status)
+            self._check_bg_after_id = self.after(5000, self._check_background_loading_status)
 
     def load_batch(self):
         """Load and display images immediately as they become available, filling ALL rows."""
+        self._hide_hover_tip()     # grid contents change out from under the cursor
         self.canvas.delete("all")  # Clear the canvas
         self.image_labels = []
         row_widths = [0] * self.num_rows
@@ -731,25 +1418,34 @@ class ImageSorter(tk.Tk):
         # Show preloaded images first, then continue loading until all rows are filled
         self.show_batch_loading_indicator()
         
-        # Start with preloaded images
+        # Start with preloaded images. When one doesn't fit the remaining gaps,
+        # set it aside (deferred) and keep scanning the buffer — a narrower image
+        # further along may fill the gap the current one couldn't. Deferred and
+        # unused entries STAY in the buffer (deferred ones back at the front), so
+        # their decoded bitmaps are reused by the next page instead of redone.
         preloaded_used = 0
-        while self.preloaded_images:
-            image_file, tk_img, img_width, aspect_ratio = self.preloaded_images.pop(0)
-            if self._try_place_image_immediately(image_file, tk_img, img_width, aspect_ratio, row_widths):
+        deferred_preloaded = []
+        while self.preloaded_images and self._has_unfilled_rows(row_widths):
+            entry = self.preloaded_images.pop(0)
+            if self._try_place_image_immediately(*entry, row_widths):
                 preloaded_used += 1
             else:
-                # Can't place this image - rows are full
-                # Put back this image and all remaining preloaded images into main queue
-                files_to_restore = [image_file] + [f for f, _, _, _ in self.preloaded_images]
-                self.images = files_to_restore + self.images
-                self.preloaded_images.clear()
-                break  # Stop trying preloaded images, rows are full
-        
-        # Continue loading and placing images until ALL rows are filled or no more images
+                deferred_preloaded.append(entry)
+        if deferred_preloaded:
+            self.preloaded_images[0:0] = deferred_preloaded
+
+        # Continue loading and placing images until ALL rows are filled or no more images.
+        # A placement miss no longer stops the fill: the image is deferred (returned to
+        # the queue afterward) and scanning continues so a narrower image can backfill the
+        # gap. A run of consecutive misses (no image fit any gap) ends the scan so we don't
+        # decode the whole remaining collection chasing a shrinking gap.
         images_processed = 0
         start_time = time.time()
-        
-        while self._has_unfilled_rows(row_widths) and self.images:
+        main_deferred = []
+        misses = 0
+        MAX_CONSECUTIVE_MISSES = 60
+
+        while self._has_unfilled_rows(row_widths) and self.images and misses < MAX_CONSECUTIVE_MISSES:
             image_file = self.images.pop(0)
             
             # Update loading indicator every 5 images
@@ -758,71 +1454,47 @@ class ImageSorter(tk.Tk):
                 self.update_idletasks()  # Allow UI updates
             
             try:
-                # Quick size check - warn but don't skip, PIL can handle large files
-                file_size = os.path.getsize(image_file)
-                if file_size > 100 * 1024 * 1024:  # Only skip truly enormous files (>100MB)
-                    self.skipped_images.append((image_file, "File too large (>100MB)"))
+                if not self._check_file_size(image_file):
                     images_processed += 1
                     continue
-                elif file_size > 50 * 1024 * 1024:  # Warn about large files
-                    print(f"Loading large file ({file_size // (1024*1024)}MB): {os.path.basename(image_file)}")
-                
-                # Load and process image
-                img = Image.open(image_file)
-                total_pixels = img.width * img.height
-                
-                if total_pixels > 100000000:  # Generate thumbnail for very large images
-                    original_size = f"{img.width}x{img.height}"
-                    print(f"Generating thumbnail for large image: {os.path.basename(image_file)} ({original_size})")
-                    try:
-                        # Create thumbnail - maintains aspect ratio, modifies image in-place
-                        img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
-                        total_pixels = img.width * img.height  # Recalculate after thumbnail
-                        print(f"  Thumbnail created: {original_size} -> {img.width}x{img.height}")
-                    except Exception as thumb_e:
-                        print(f"  Failed to create thumbnail: {thumb_e}")
-                        # If thumbnail fails, skip this image
-                        img.close()
-                        self.skipped_images.append((image_file, f"Thumbnail generation failed: {thumb_e}"))
-                        images_processed += 1
-                        continue
-                
-                # Calculate dimensions
-                aspect_ratio = img.width / img.height
-                new_height = self.row_height
-                new_width = int(new_height * aspect_ratio)
-                
-                # Resize image
-                if total_pixels > 25000000:
-                    resized_img = img.resize((new_width, new_height), Image.Resampling.NEAREST)
-                elif total_pixels > 10000000:
-                    resized_img = img.resize((new_width, new_height), Image.Resampling.BILINEAR)
-                else:
-                    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                
-                img.close()
-                tk_img = ImageTk.PhotoImage(resized_img)
-                resized_img.close()
-                
+
+                # Cached dimensions tell us whether it can fit BEFORE paying for
+                # a decode; a miss here costs a DB lookup, not a full image load.
+                new_width, aspect_ratio = self._display_size(image_file)
+                if not self._fits_any_row(new_width, row_widths):
+                    main_deferred.append(image_file)
+                    misses += 1
+                    images_processed += 1
+                    continue
+
+                tk_img, new_width, aspect_ratio = self._load_display_image(image_file)
+
                 # Try to place the image immediately
                 if self._try_place_image_immediately(image_file, tk_img, new_width, aspect_ratio, row_widths):
+                    misses = 0
                     # Successfully placed - update display every few images
                     if images_processed % 3 == 0:
                         self.update_idletasks()
                 else:
-                    # If it can't be placed, put it back for next batch
-                    self.images.append(image_file)
-                    break
-                    
+                    # Didn't fit any current gap: defer it and keep scanning so a
+                    # narrower image can backfill. Deferred files are restored below.
+                    main_deferred.append(image_file)
+                    misses += 1
+
             except Exception as e:
                 print(f"Error loading {os.path.basename(image_file)}: {e}")
                 self.skipped_images.append((image_file, f"Load error: {str(e)}"))
-            
+
             images_processed += 1
-            
+
             # Safety valve - don't load forever
             if time.time() - start_time > 10.0:
                 break
+
+        # Return deferred (decoded but unplaced) images to the front of the queue,
+        # preserving order, so the next page picks them up first.
+        if main_deferred:
+            self.images = main_deferred + self.images
 
         # Clear loading indicator
         self.clear_batch_loading_indicator()
@@ -871,6 +1543,10 @@ class ImageSorter(tk.Tk):
             if remaining_space > min_useful_space and row_width < self.screen_width * 0.95:
                 return True
         return False
+
+    def _fits_any_row(self, img_width, row_widths):
+        """True if some row has room for img_width (same test placement uses)."""
+        return any(self.screen_width - row_width >= img_width for row_width in row_widths)
 
     def _try_place_image_immediately(self, image_file, tk_img, img_width, aspect_ratio, row_widths):
         """Try to place an image immediately and return True if successful."""
@@ -923,6 +1599,8 @@ class ImageSorter(tk.Tk):
         """Sort an image into the specified category."""
         if self.is_loading:
             return
+
+        self._hide_hover_tip()
 
         if image_file is None and event is not None:
             # Find the image at the click coordinates
@@ -992,11 +1670,13 @@ class ImageSorter(tk.Tk):
                     self.stats[f'sorted_to_{category}'] += 1
                     
                 self.update_stats_display()
-                    
+                return dest_file
+
             except Exception as e:
                 print(f"Error processing image {src_file}: {e}")
         else:
             print(f"File not found: {src_file}")
+        return None
 
     def clear_image(self, image_file):
         """Remove an image from the display."""
@@ -1031,6 +1711,8 @@ class ImageSorter(tk.Tk):
         """Move to the next page of images."""
         if self.is_loading:
             return
+
+        self._hide_hover_tip()
 
         # Check if we have enough preloaded images for instant page transition
         if len(self.preloaded_images) >= self.min_images_to_display:
@@ -1209,10 +1891,10 @@ class ImageSorter(tk.Tk):
         skipped = len(self.skipped_images)
         
         if skipped > 0:
-            self.title(f'Enhanced Image Sorter - {processable_remaining} remaining ({skipped} skipped)')
+            self._update_title(f'Enhanced Image Sorter - {processable_remaining} remaining ({skipped} skipped)')
             self.stats_label.config(text=f"Images: {processable_remaining} | Processed: {processed} | Skipped: {skipped}")
         else:
-            self.title(f'Enhanced Image Sorter - {processable_remaining} images remaining')
+            self._update_title(f'Enhanced Image Sorter - {processable_remaining} images remaining')
             self.stats_label.config(text=f"Images: {processable_remaining} | Processed: {processed}")
     
     def show_welcome_message(self):
@@ -1695,6 +2377,11 @@ class ImageSorter(tk.Tk):
         """Open the term manager dialog."""
         TermManagerDialog(self, self.config_manager)
 
+    def take_out_trash(self):
+        """Open the trash cleanup dialog."""
+        from trash_cleanup_dialog import TrashCleanupDialog
+        TrashCleanupDialog(self, self.config_manager)
+
     def launch_ranker_for_category1(self, event=None):
         """Launch the image ranker pre-loaded with category 1 (left-click) folder."""
         try:
@@ -1819,6 +2506,7 @@ class ImageSorter(tk.Tk):
     def export_terms(self):
         """Export auto-sort terms."""
         filename = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(),
             title="Export Terms",
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
@@ -1834,6 +2522,7 @@ class ImageSorter(tk.Tk):
     def import_terms(self):
         """Import auto-sort terms."""
         filename = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(),
             title="Import Terms",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
@@ -2259,8 +2948,9 @@ Perfect for organizing AI-generated images, photos, and other image collections.
             from rebuild_tag_database import TagDatabaseRebuilder
             from pathlib import Path
 
-            # Create a simple progress window
-            progress_window = tk.Toplevel(self)
+            # Create a simple progress window (anchor to the toplevel window so
+            # it positions correctly whether embedded in the hub or standalone).
+            progress_window = tk.Toplevel(self.winfo_toplevel())
             progress_window.title("Updating Tag Database")
             progress_window.geometry("400x150")
             progress_window.resizable(False, False)
@@ -2358,37 +3048,43 @@ Perfect for organizing AI-generated images, photos, and other image collections.
             logger.error(f"Failed to start tag database rebuild: {e}")
 
     def toggle_fullscreen(self, event=None):
-        """Toggle fullscreen mode."""
-        is_fullscreen = self.attributes('-fullscreen')
-        self.attributes('-fullscreen', not is_fullscreen)
+        """Toggle fullscreen mode (standalone only; no-op when embedded)."""
+        if self.hub is not None:
+            return
+        toplevel = self.winfo_toplevel()
+        is_fullscreen = toplevel.attributes('-fullscreen')
+        toplevel.attributes('-fullscreen', not is_fullscreen)
         if not is_fullscreen:
-            self.state('zoomed')
-        
+            toplevel.state('zoomed')
+
         # Recalculate dimensions and reload current batch
         self.after(100, self._recalculate_and_reload)  # Small delay to let window resize
-    
+
     def _recalculate_and_reload(self):
         """Recalculate dimensions and reload the current batch."""
         self.update_idletasks()
-        
-        # Recalculate dimensions
-        if self.attributes('-fullscreen'):
-            self.screen_width = self.winfo_screenwidth()
-            self.screen_height = self.winfo_screenheight()
-            available_height = self.screen_height - 80
-        else:
-            self.screen_width = self.winfo_width()
-            self.screen_height = self.winfo_height()
-            available_height = self.screen_height - 120
-        
-        self.row_height = available_height // self.num_rows
-        
-        # Reload current batch with new dimensions
+        self._measure_grid()
+
         if hasattr(self, 'current_batch') and self.current_batch:
-            # Put current batch back into the main queue
-            self.images = self.current_batch + self.images
-            self.current_batch = []
-            self.load_batch()
+            self._reload_current_batch()
+
+    def _reload_current_batch(self):
+        """Re-display the on-screen batch at the current grid dimensions.
+
+        Sorted images have already been pruned from current_batch, so this
+        never resurrects files that were moved.
+        """
+        # preloaded_images holds PhotoImages resized to the OLD row_height;
+        # keeping them would mix two row heights in the reflowed grid. Push
+        # their paths back onto the queue and drop the stale bitmaps.
+        if self.preloaded_images:
+            self.images = [item[0] for item in self.preloaded_images] + self.images
+            self.preloaded_images = []
+
+        # Put the visible batch back at the front of the queue and re-lay it out.
+        self.images = self.current_batch + self.images
+        self.current_batch = []
+        self.load_batch()
 
 if __name__ == '__main__':
     try:
@@ -2405,15 +3101,6 @@ if __name__ == '__main__':
         if valid_sources:
             # Skip setup dialog - use existing config
             folder = valid_sources[0] if valid_sources else ''
-
-            # Start the main application directly
-            app = ImageSorter(
-                folder,
-                settings['num_rows'],
-                settings['random_order'],
-                settings['copy_instead_of_move']
-            )
-            app.mainloop()
         else:
             # No valid sources - show configuration dialog
             temp_root = tk.Tk()
@@ -2430,14 +3117,24 @@ if __name__ == '__main__':
             settings = result
             folder = result['folder']
 
-            # Start the main application
-            app = ImageSorter(
-                folder,
-                settings['num_rows'],
-                settings['random_order'],
-                settings['copy_instead_of_move']
-            )
-            app.mainloop()
+        # Standalone mode: ImageSorter is a tk.Frame, so host it in a throwaway
+        # fullscreen root and drive it with activate() (mirrors what the hub does
+        # when embedding it as a panel).
+        root = tk.Tk()
+        root.title('Enhanced Image Sorter')
+        root.state('zoomed')
+        root.attributes('-fullscreen', True)
+        sorter = ImageSorter(
+            root,
+            None,  # hub=None -> standalone
+            folder,
+            settings['num_rows'],
+            settings['random_order'],
+            settings['copy_instead_of_move']
+        )
+        sorter.pack(fill=tk.BOTH, expand=True)
+        sorter.activate()
+        root.mainloop()
         
     except Exception as e:
         print(f"Error starting application: {e}")

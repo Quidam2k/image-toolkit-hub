@@ -44,6 +44,7 @@ class DescriptiveTagGenerator:
         self.tags_path = tags_path
         self.threshold = threshold
         self.loaded = False
+        self.cancelled = False  # Cancellation flag for interruptible processing
 
         # Initialize WD14 tagger
         self._load_model()
@@ -68,6 +69,15 @@ class DescriptiveTagGenerator:
         except Exception as e:
             self.logger.error(f"Failed to initialize WD14 tagger: {e}")
             self.loaded = False
+
+    def cancel(self):
+        """Cancel any ongoing processing."""
+        self.cancelled = True
+        self.logger.info("Tag generation cancelled by user")
+
+    def reset(self):
+        """Reset cancellation flag for new processing run."""
+        self.cancelled = False
 
     def analyze_image_with_wd14(self, image_path):
         """
@@ -220,7 +230,16 @@ class DescriptiveTagGenerator:
         total = len(image_files)
         print(f"Found {total} images to process")
 
+        # Reset cancellation flag for new run
+        self.cancelled = False
+
         for i, image_path in enumerate(image_files):
+            # Check for cancellation
+            if self.cancelled:
+                print(f"Processing cancelled at {i}/{total}")
+                results['cancelled'] = True
+                break
+
             try:
                 # Generate tags
                 tag_result = self.generate_tags_for_image(image_path)

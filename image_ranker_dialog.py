@@ -942,8 +942,9 @@ class ImageRankerDialog(tk.Toplevel):
                 # Display on main thread
                 def display():
                     self.current_pair = pair
-                    self.left_photo = ImageTk.PhotoImage(left_pil)
-                    self.right_photo = ImageTk.PhotoImage(right_pil)
+                    # Store PIL images for _display_preloaded to use
+                    self.preloaded_left_pil_orig = left_pil
+                    self.preloaded_right_pil_orig = right_pil
                     self._display_preloaded()
                     # Start preloading next pair
                     self.executor.submit(self._preload_next)
@@ -963,19 +964,16 @@ class ImageRankerDialog(tk.Toplevel):
             if self.preloaded_pair is not None:
                 # Use the preloaded pair
                 self.current_pair = self.preloaded_pair
-                left_pil = self.preloaded_left_pil
-                right_pil = self.preloaded_right_pil
+                # Store PIL images for _display_preloaded to use
+                self.preloaded_left_pil_orig = self.preloaded_left_pil
+                self.preloaded_right_pil_orig = self.preloaded_right_pil
 
                 # Clear preload state
                 self.preloaded_pair = None
                 self.preloaded_left_pil = None
                 self.preloaded_right_pil = None
 
-                # Convert PIL to PhotoImage on main thread (required by Tkinter)
-                self.left_photo = ImageTk.PhotoImage(left_pil)
-                self.right_photo = ImageTk.PhotoImage(right_pil)
-
-                # Display instantly
+                # Display (will resize to fit canvas)
                 self._display_preloaded()
 
                 # Start preloading the next pair
@@ -997,11 +995,16 @@ class ImageRankerDialog(tk.Toplevel):
         self.executor.submit(self._preload_next)
 
     def _display_preloaded(self):
-        """Display the preloaded images (instant, no disk I/O)."""
+        """Display the preloaded images, scaled to fit canvas."""
         pair = self.current_pair
 
-        # Left image
+        # Left image - fit to canvas
         self.left_canvas.delete("all")
+        self.left_canvas.update_idletasks()
+        self.left_photo = self._fit_image_to_canvas(
+            self.preloaded_left_pil_orig,
+            self.left_canvas
+        )
         x = self.left_canvas.winfo_width() // 2
         y = self.left_canvas.winfo_height() // 2
         self.left_canvas.create_image(x, y, image=self.left_photo, anchor="center")
@@ -1011,8 +1014,13 @@ class ImageRankerDialog(tk.Toplevel):
         )
         self.left_name.config(text=self._format_image_path(pair[0]))
 
-        # Right image
+        # Right image - fit to canvas
         self.right_canvas.delete("all")
+        self.right_canvas.update_idletasks()
+        self.right_photo = self._fit_image_to_canvas(
+            self.preloaded_right_pil_orig,
+            self.right_canvas
+        )
         x = self.right_canvas.winfo_width() // 2
         y = self.right_canvas.winfo_height() // 2
         self.right_canvas.create_image(x, y, image=self.right_photo, anchor="center")
@@ -1047,22 +1055,61 @@ class ImageRankerDialog(tk.Toplevel):
             logger.error(f"Error preloading images: {e}")
 
     def _load_pil_image(self, img: RankedImage) -> Image.Image:
-        """Load and resize an image, returning a PIL Image (thread-safe)."""
+        """Load an image, returning a PIL Image (thread-safe).
+
+        Returns the original image without resizing - resizing is done at display time
+        to fit the actual canvas dimensions.
+        """
         pil_img = Image.open(img.filepath)
 
         # Convert to RGB if necessary (for RGBA, P mode images)
         if pil_img.mode not in ('RGB', 'L'):
             pil_img = pil_img.convert('RGB')
 
-        # Use fixed max size for preloading
-        max_size = self.MAX_IMAGE_SIZE
-
-        ratio = min(max_size / pil_img.width, max_size / pil_img.height)
+        # Do initial downscale if image is very large (memory optimization)
+        # Use a generous max that's larger than any reasonable canvas
+        max_preload = 1200
+        ratio = min(max_preload / pil_img.width, max_preload / pil_img.height)
         if ratio < 1:
             new_size = (int(pil_img.width * ratio), int(pil_img.height * ratio))
             pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
 
         return pil_img
+
+    def _fit_image_to_canvas(self, pil_or_photo, canvas) -> ImageTk.PhotoImage:
+        """Resize a PIL image to fit within canvas bounds and return PhotoImage.
+
+        Args:
+            pil_or_photo: Either a PIL Image or existing PhotoImage
+            canvas: The canvas to fit the image into
+
+        Returns:
+            ImageTk.PhotoImage sized to fit the canvas
+        """
+        # Get canvas dimensions with padding
+        canvas_w = canvas.winfo_width() - 20
+        canvas_h = canvas.winfo_height() - 20
+
+        # Fallback if canvas not yet rendered
+        if canvas_w < 100:
+            canvas_w = 550
+        if canvas_h < 100:
+            canvas_h = 650
+
+        # If we have a PIL image, resize it
+        if isinstance(pil_or_photo, Image.Image):
+            pil_img = pil_or_photo
+
+            # Calculate scale to fit within canvas
+            ratio = min(canvas_w / pil_img.width, canvas_h / pil_img.height)
+            if ratio < 1:
+                new_size = (int(pil_img.width * ratio), int(pil_img.height * ratio))
+                pil_img = pil_img.resize(new_size, Image.Resampling.LANCZOS)
+
+            return ImageTk.PhotoImage(pil_img)
+
+        # If it's already a PhotoImage, return as-is (fallback)
+        return pil_or_photo
 
     def _load_and_display_image(self, img: RankedImage, side: str):
         """Load and display an image (synchronous, for first load)."""

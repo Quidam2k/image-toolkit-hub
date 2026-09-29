@@ -19,20 +19,23 @@ build/
 # Claude Code
 .claude/
 
-# User data - sorting destination folders
+# Output folders (new structure)
+output/
+
+# Legacy sorting destination folders (pre-3.0)
 1/
 2/
 3/
 removed/
 unmatched/
 recycle_bin/
+auto_sorted/
+sorted_*/
 
 # Image collections - user content
 master_images/
 master_images_old/
 master_images_test/
-auto_sorted/
-sorted_*/
 tshirt_ready_*/
 batch_exports/
 processed_batches/
@@ -94,3 +97,6 @@ nul
 con
 prn
 aux
+
+# Persistent thumbnail cache (regenerable)
+data/thumb_cache/

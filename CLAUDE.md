@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Enhanced Image Grid Sorter** - A comprehensive Python/Tkinter application for visually sorting and organizing large image collections with AI-powered auto-sorting capabilities. The tool processes tens of thousands of images using metadata-based term matching, multi-tag support, and intelligent categorization.
 
-**Current Version:** 2.1 (includes all_combinations mode and re-sort functionality)
+**Current Version:** 3.0 (output folder restructuring + category labels)
 
 ## Development Commands
 
@@ -46,11 +46,23 @@ python scripts/quick_prompt_backup.py
 python metadata_parser.py
 ```
 
-## Project Structure (Updated November 2025)
+## Project Structure (Updated April 2026)
 
 ```
 image_grid_sorter/
 ├── *.py                    # Core application modules (main files)
+├── output/                 # All sorted output (v3.0+)
+│   ├── manual/             # Manual sorting output
+│   │   └── {source_name}/  # Per-source folders
+│   │       ├── keep/       # Category 1 (label configurable)
+│   │       ├── maybe/      # Category 2 (label configurable)
+│   │       ├── trash/      # Category 3 (label configurable)
+│   │       └── removed/    # Sweep/removed (label configurable)
+│   └── auto/               # Auto-sort output
+│       └── {source_name}/  # Per-source folders
+│           ├── cowgirl/    # Auto-sort term folders
+│           ├── unmatched/  # Images matching no terms
+│           └── ...
 ├── tests/                  # Test files
 ├── scripts/                # Utility and one-off scripts
 ├── docs/                   # Documentation
@@ -149,6 +161,13 @@ The application follows a modular architecture with clear separation of concerns
 - `source_folders` - Array of directories to scan for images
 - `active_sources` - Boolean map for enabling/disabling sources
 - `destination_location` - 'script_dir' or 'source_dirs' for output placement
+- `output_base` - Base output directory name (default: 'output')
+- `category_labels` - Per-source category labels and roles:
+  - `__default__` - Fallback labels for all sources
+  - `{source_path}` - Override labels for specific source
+  - Each maps category key ('1','2','3','removed') to `{label, role}`
+  - `label` becomes the folder name on disk (e.g., 'keep', 'trash')
+  - `role` is 'keep' or 'trash' (used by Take Out the Trash feature)
 - `auto_sort_terms` - Array of search terms with properties:
   - `term` - Search string
   - `folder_name` - Output folder name
@@ -235,14 +254,17 @@ Before claiming something is "fixed or ready":
 
 ### Manual Sorting Workflow
 1. Grid displays images in configured number of rows
-2. Left-click or press '1' → Sort to category 1
-3. Right-click or press space → Next page
-4. Mouse button 4 or press '2' → Sort to category 2
-5. Mouse button 5 or press '3' → Sort to category 3
+2. Left-click or press '1' → Sort to category 1 (default label: "keep")
+3. Right-click or press space → Next page (unsorted images swept to "removed" folder)
+4. Mouse button 4 or press '2' → Sort to category 2 (default label: "maybe")
+5. Mouse button 5 or press '3' → Sort to category 3 (default label: "trash")
 6. Press 'r' → Reload images from disk
 7. Press 'R' (Shift+R) → Open ranker with category 1 folder
 8. Ctrl+A → Start auto-sort process
 9. Press Escape → Exit application
+
+Category labels and roles (keep/trash) are configurable per source folder in Settings.
+Output goes to `output/manual/{source_name}/{label}/` (script_dir mode) or inside the source folder (source_dirs mode).
 
 Note: Settings/configuration are now managed in the Hub, not via keyboard shortcut.
 
@@ -417,6 +439,15 @@ When using WAN video LoRAs that depict specific actions (e.g., running, dancing,
 3. **UX Improvements** - Tooltips, help documentation, performance monitoring
 4. **Multi-Tag Optimization** - Balanced distribution algorithm implementation (in progress)
 
+## Refinement Sorting & Custom Category Names (March 2026)
+
+**When user asks about re-sorting, refining sorted results, refer to: `docs/REFINEMENT_SORTING_DESIGN.md`**
+
+Status:
+1. **Custom category names** - IMPLEMENTED (v3.0). Category labels are configurable per source folder in Settings with keep/trash roles. Folder names on disk use the labels.
+2. **Refinement sorting mode** - Not yet implemented. Streamlined workflow for making a second pass on already-sorted collections.
+3. **Smarter destination naming** - RESOLVED (v3.0). Output now uses `output/manual/{source_name}/{label}/` instead of confusing `sorted_1/` paths.
+
 ## UI Redesign Plan (January 2026)
 
 **When user says "fix the UX" or asks about UI improvements, refer to: `docs/UI_REDESIGN_PLAN.md`**
@@ -474,6 +505,25 @@ copy_with_companions(src, dst)
 success, error = check_disk_space(file_list, destination)
 ```
 
+## Thumbnail Cache & Prompt Lookup (September 2026)
+
+### thumb_cache.py
+Persistent cache in `data/thumb_cache/` (gitignored, regenerable): `index.db` (SQLite dims + thumb index) and row-height-sized JPEG thumbs keyed by sha1(path|mtime|size|row_height). Pruned to 2GB in a background thread at sorter startup.
+
+```python
+import thumb_cache
+cache = thumb_cache.get_cache()
+w, h = cache.get_dims(path)             # hit = no image open
+img = cache.load_thumb(path, row_height)  # hit = tiny JPEG open
+```
+
+The grid's `load_batch` fit-tests images from cached dims BEFORE decoding, keeps unplaced preloaded bitmaps across pages, and the background worker warms the disk cache ~600 images ahead. All grid decodes go through `ImageSorter._load_display_image()`.
+
+### Prompt lookup
+`MetadataParser.get_prompt_text(metadata) -> (text, source)` is the single entry point for "what was this image's prompt" (hover status bar + wheel save). Order: A1111 `positive_prompt` → ComfyUI graph (`prompt`/`workflow` chunks, positive branch only) → Midjourney (`Description`, XMP `dc:description`, EXIF ImageDescription; `Job ID` stripped) → tags → raw parameters.
+
+Tests: `tests/test_thumb_cache.py`, `tests/test_prompt_sources.py` (synthetic images only).
+
 ## Future Feature Ideas
 
 **See: `docs/POTENTIAL_FEATURES.md`**
@@ -485,7 +535,14 @@ A living document of feature ideas organized by category and effort level. Inclu
 
 ---
 
-Last Updated: January 17, 2026
+Last Updated: April 1, 2026
+- **Output folder restructuring (v3.0)**: All output now under `output/manual/` and `output/auto/` with per-source separation
+- **Category labels**: Configurable folder names per source (keep/maybe/trash/removed) with keep/trash roles
+- **Take Out the Trash**: Bulk-delete contents of trash-role folders from File menu or Hub
+- **Migration script**: `scripts/migrate_output_folders.py` moves legacy `sorted_*` folders into new structure
+- **Removed 'both' destination mode**: Simplified to script_dir or source_dirs only
+
+Previous updates (January 17, 2026):
 - **Toast notifications**: Non-blocking notifications for operation completion/errors
 - **Thread-safe ConfigManager**: Added locking for safe access during background operations
 - **Shared file_ops module**: Centralized companion file handling

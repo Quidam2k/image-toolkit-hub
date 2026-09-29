@@ -193,32 +193,83 @@ class SetupDialog:
         dest_frame = ttk.LabelFrame(main_frame, text="Destination Folders", padding="10")
         dest_frame.pack(fill="x", pady=(0, 10))
 
-        # Get current preferences from config
-        dest_in_script = True  # default
-        dest_in_source = False  # default
+        # Get current destination preference
+        current_dest = 'script_dir'
         if self.config_manager:
-            dest_settings = self.config_manager.config.get('destination_settings', {})
-            dest_in_script = dest_settings.get('script_dir', True)
-            dest_in_source = dest_settings.get('source_dirs', False)
+            current_dest = self.config_manager.config.get('destination_location', 'script_dir')
+            if current_dest == 'both':
+                current_dest = 'script_dir'
 
-        # Script directory checkbox
-        self.dest_script_var = tk.BooleanVar(master=self.window, value=dest_in_script)
-        script_check = ttk.Checkbutton(dest_frame,
-                                      text="Script directory - organized by source (sorted_SourceName/1, 2, 3...)",
-                                      variable=self.dest_script_var)
-        script_check.pack(anchor="w", pady=(0, 5))
+        self.dest_location_var = tk.StringVar(master=self.window, value=current_dest)
 
-        # Source directory checkbox
-        self.dest_source_var = tk.BooleanVar(master=self.window, value=dest_in_source)
-        source_check = ttk.Checkbutton(dest_frame,
-                                      text="Inside each source directory (1, 2, 3 folders in each source)",
-                                      variable=self.dest_source_var)
-        source_check.pack(anchor="w", pady=(0, 5))
+        ttk.Radiobutton(dest_frame,
+                       text="Project directory (output/manual/SourceName/...)",
+                       variable=self.dest_location_var,
+                       value='script_dir').pack(anchor="w", pady=(0, 3))
+
+        ttk.Radiobutton(dest_frame,
+                       text="Inside each source directory",
+                       variable=self.dest_location_var,
+                       value='source_dirs').pack(anchor="w", pady=(0, 5))
 
         # Auto-create checkbox
         self.auto_create_var = tk.BooleanVar(master=self.window, value=True)
         ttk.Checkbutton(dest_frame, text="Auto-create destination folders",
                        variable=self.auto_create_var).pack(anchor="w")
+
+        # Category Labels section
+        labels_frame = ttk.LabelFrame(main_frame, text="Category Labels", padding="10")
+        labels_frame.pack(fill="x", pady=(0, 10))
+
+        labels_info = ttk.Label(labels_frame,
+            text="Set folder names and roles for each sort action. Trash-role folders can be bulk-deleted.",
+            style="Dim.TLabel", wraplength=900)
+        labels_info.pack(anchor="w", pady=(0, 8))
+
+        # Source selector for labels (only shown when multiple sources)
+        self.labels_source_frame = ttk.Frame(labels_frame)
+        self.labels_source_frame.pack(fill="x", pady=(0, 5))
+
+        # Build the labels grid
+        self.labels_grid_frame = ttk.Frame(labels_frame)
+        self.labels_grid_frame.pack(fill="x")
+
+        # Header row
+        ttk.Label(self.labels_grid_frame, text="Action", width=18).grid(row=0, column=0, padx=5, sticky="w")
+        ttk.Label(self.labels_grid_frame, text="Folder Name", width=15).grid(row=0, column=1, padx=5, sticky="w")
+        ttk.Label(self.labels_grid_frame, text="Role", width=10).grid(row=0, column=2, padx=5, sticky="w")
+
+        # Category rows
+        self.label_entries = {}
+        self.role_vars = {}
+        categories = [
+            ('1', 'Left-click (1)'),
+            ('2', 'Mouse4 (2)'),
+            ('3', 'Mouse5 (3)'),
+            ('removed', 'Sweep (removed)'),
+        ]
+
+        # Load current labels
+        current_labels = {}
+        if self.config_manager:
+            current_labels = self.config_manager.get_category_labels()
+
+        for i, (cat_key, cat_desc) in enumerate(categories, start=1):
+            cat_info = current_labels.get(cat_key, {'label': cat_key, 'role': 'keep'})
+
+            ttk.Label(self.labels_grid_frame, text=cat_desc).grid(row=i, column=0, padx=5, pady=2, sticky="w")
+
+            entry_var = tk.StringVar(master=self.window, value=cat_info.get('label', cat_key))
+            entry = ttk.Entry(self.labels_grid_frame, textvariable=entry_var, width=18)
+            entry.grid(row=i, column=1, padx=5, pady=2, sticky="w")
+            self.label_entries[cat_key] = entry_var
+
+            role_var = tk.StringVar(master=self.window, value=cat_info.get('role', 'keep'))
+            role_frame = ttk.Frame(self.labels_grid_frame)
+            role_frame.grid(row=i, column=2, padx=5, pady=2, sticky="w")
+            ttk.Radiobutton(role_frame, text="Keep", variable=role_var, value='keep').pack(side="left")
+            ttk.Radiobutton(role_frame, text="Trash", variable=role_var, value='trash').pack(side="left", padx=(5, 0))
+            self.role_vars[cat_key] = role_var
         
         # Tool Buttons frame - 2x2 grid
         tool_frame = ttk.LabelFrame(main_frame, text="Tools", padding="15")
@@ -414,54 +465,12 @@ class SetupDialog:
         """Create destination folders based on user preference."""
         if not self.auto_create_var.get():
             return True
-        
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        folders_to_create = ['1', '2', '3', 'removed', 'auto_sorted', 'unmatched']
-        created_folders = []
-        
+
         try:
-            for source_folder in active_folders:
-                source_name = self.sanitize_folder_name(os.path.basename(source_folder))
-                
-                # Script directory organized folders
-                if self.dest_script_var.get():
-                    source_dest_dir = os.path.join(script_dir, f"sorted_{source_name}")
-                    
-                    # Create the main destination directory for this source
-                    if not os.path.exists(source_dest_dir):
-                        os.makedirs(source_dest_dir)
-                        created_folders.append(f"sorted_{source_name}/")
-                    
-                    # Create subdirectories within this source's destination
-                    for folder_name in folders_to_create:
-                        folder_path = os.path.join(source_dest_dir, folder_name)
-                        if not os.path.exists(folder_path):
-                            os.makedirs(folder_path)
-                            created_folders.append(f"sorted_{source_name}/{folder_name}")
-                
-                # Source directory folders
-                if self.dest_source_var.get():
-                    for folder_name in folders_to_create:
-                        folder_path = os.path.join(source_folder, folder_name)
-                        if not os.path.exists(folder_path):
-                            os.makedirs(folder_path)
-                            created_folders.append(f"{os.path.basename(source_folder)}/{folder_name}")
-            
-            if created_folders:
-                locations = []
-                if self.dest_script_var.get():
-                    locations.append("script directory")
-                if self.dest_source_var.get():
-                    locations.append("source directories")
-                location_desc = " and ".join(locations)
-                
-                messagebox.showinfo("Folders Created", 
-                                   f"Created destination folders in {location_desc}:\n\n" + 
-                                   "\n".join(created_folders[:15]) +
-                                   (f"\n... and {len(created_folders)-15} more" if len(created_folders) > 15 else ""))
-            
+            # ConfigManager.setup_folders() handles all folder creation
+            if self.config_manager:
+                self.config_manager.setup_folders()
             return True
-            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create destination folders: {e}")
             return False
@@ -498,14 +507,13 @@ class SetupDialog:
         primary_folder = active_folders[0] if active_folders else ""
         
         # Collect settings
+        dest_loc = self.dest_location_var.get()
+
         self.result = {
             'folder': primary_folder,
             'source_folders': active_folders,
             'active_sources': self.active_sources.copy(),
-            'destination_settings': {
-                'script_dir': self.dest_script_var.get(),
-                'source_dirs': self.dest_source_var.get()
-            },
+            'destination_location': dest_loc,
             'num_rows': self.rows_var.get(),
             'random_order': self.random_var.get(),
             'copy_instead_of_move': self.copy_var.get(),
@@ -513,7 +521,7 @@ class SetupDialog:
             'hide_already_sorted': self.hide_sorted_var.get(),
             'include_subfolders': self.include_subfolders_var.get()
         }
-        
+
         # Update config manager if available
         if self.config_manager:
             # Update basic settings
@@ -524,21 +532,30 @@ class SetupDialog:
                 copy_instead_of_move=self.copy_var.get(),
                 include_subfolders=self.include_subfolders_var.get()
             )
-            
+
             # Update source folders and active sources
             self.config_manager.config['source_folders'] = self.source_folders
             self.config_manager.config['active_sources'] = self.active_sources
-            self.config_manager.config['destination_settings'] = {
-                'script_dir': self.dest_script_var.get(),
-                'source_dirs': self.dest_source_var.get()
-            }
-            
+
+            # Write destination_location
+            self.config_manager.config['destination_location'] = dest_loc
+
+            # Save category labels
+            labels_dict = {}
+            for cat_key in ('1', '2', '3', 'removed'):
+                labels_dict[cat_key] = {
+                    'label': self.label_entries[cat_key].get().strip() or cat_key,
+                    'role': self.role_vars[cat_key].get()
+                }
+            # Save as default (applies to all sources unless overridden)
+            self.config_manager.set_category_labels('__default__', labels_dict)
+
             # Update UI preferences for tag handling
             if 'ui_preferences' not in self.config_manager.config:
                 self.config_manager.config['ui_preferences'] = {}
             self.config_manager.config['ui_preferences']['handle_tag_files'] = self.handle_tags_var.get()
             self.config_manager.config['ui_preferences']['hide_already_sorted'] = self.hide_sorted_var.get()
-            
+
             self.config_manager.save_config()
         
         self.window.destroy()

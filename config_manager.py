@@ -42,7 +42,7 @@ class ConfigManager:
     Configuration is stored in JSON format with automatic backup and recovery.
     """
     
-    CURRENT_VERSION = "2.1"  # Updated to reflect new features
+    CURRENT_VERSION = "3.0"  # Output folder restructuring + category labels
     
     def __init__(self, config_file='imagesorter_config.json', legacy_config_file='config.ini'):
         self.config_file = config_file
@@ -58,11 +58,20 @@ class ConfigManager:
             'source_folders': [],
             'output_folders': {
                 '1': '1',
-                '2': '2', 
+                '2': '2',
                 '3': '3',
                 'removed': 'removed',
                 'auto_sorted': 'auto_sorted',
                 'unmatched': 'unmatched'
+            },
+            'output_base': 'output',
+            'category_labels': {
+                '__default__': {
+                    '1': {'label': 'keep', 'role': 'keep'},
+                    '2': {'label': 'maybe', 'role': 'keep'},
+                    '3': {'label': 'trash', 'role': 'trash'},
+                    'removed': {'label': 'removed', 'role': 'trash'}
+                }
             },
             'num_rows': 5,
             'random_order': False,
@@ -99,7 +108,10 @@ class ConfigManager:
                 'show_metadata_status': True,
                 'show_progress_details': True,
                 'auto_sort_confirmation': True,
-                'hide_already_sorted': True  # Hide images already copied to destination folders
+                'hide_already_sorted': True,  # Hide images already copied to destination folders
+                'sidebar_collapsed': False,  # Hub left nav collapsed to a strip
+                'rail_collapsed': False,     # Hub right folder rail collapsed to a strip
+                'hover_tip_delay_ms': 1300   # Grid hover prompt: dwell before the tip appears
             },
             'bindings': {
                 'left_mouse': '1',
@@ -192,7 +204,7 @@ class ConfigManager:
                 'metadata_cache': self.default_config['metadata_cache'].copy(),
                 'ui_preferences': self.default_config['ui_preferences'].copy()
             })
-            
+
             # Add new output folders
             if 'output_folders' not in old_config:
                 old_config['output_folders'] = self.default_config['output_folders'].copy()
@@ -201,7 +213,28 @@ class ConfigManager:
                     'auto_sorted': 'auto_sorted',
                     'unmatched': 'unmatched'
                 })
-        
+            from_version = '2.1'
+
+        if from_version == '2.1':
+            # Add output_base and category_labels
+            old_config['output_base'] = self.default_config['output_base']
+
+            # Build default category labels from existing output_folders
+            output_folders = old_config.get('output_folders', self.default_config['output_folders'])
+            default_labels = {}
+            manual_categories = {'1', '2', '3', 'removed'}
+            for cat in manual_categories:
+                folder_name = output_folders.get(cat, cat)
+                # Assign default roles: 3 and removed are trash, rest are keep
+                role = 'trash' if cat in ('3', 'removed') else 'keep'
+                default_labels[cat] = {'label': folder_name, 'role': role}
+
+            old_config['category_labels'] = {'__default__': default_labels}
+
+            # Map 'both' destination to 'script_dir'
+            if old_config.get('destination_location') == 'both':
+                old_config['destination_location'] = 'script_dir'
+
         old_config['config_version'] = self.CURRENT_VERSION
         self.logger.info(f"Migrated config from version {from_version} to {self.CURRENT_VERSION}")
         return old_config
@@ -278,82 +311,63 @@ class ConfigManager:
         except Exception as e:
             self.logger.error(f"Error creating config backup: {e}")
     
+    def _build_source_folders(self, source_folder, base_dir):
+        """Build the sorted_folders dict for a single source under a base directory.
+
+        For script_dir mode, base_dir is the output_base path.
+        For source_dirs mode, base_dir is the source folder itself.
+        """
+        source_name = self.sanitize_folder_name(os.path.basename(source_folder))
+        dest_location = self.config.get('destination_location', 'script_dir')
+
+        if dest_location == 'script_dir':
+            manual_dir = os.path.join(base_dir, 'manual', source_name)
+            auto_dir = os.path.join(base_dir, 'auto', source_name)
+        else:
+            # source_dirs mode: output goes in the source folder directly
+            manual_dir = source_folder
+            auto_dir = os.path.join(source_folder, 'auto_sorted')
+
+        # Manual categories use labels as folder names
+        folders = {}
+        for category in ('1', '2', '3', 'removed'):
+            label = self.get_label_for_category(source_folder, category)
+            folders[category] = os.path.join(manual_dir, label)
+
+        # Auto-sort and unmatched
+        folders['auto_sorted'] = auto_dir
+        folders['unmatched'] = os.path.join(auto_dir, 'unmatched')
+
+        return folders
+
     def setup_folders(self):
         """Create output folders including auto-sort destinations."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Get active source folders and destination preference
         active_sources = self.get_active_source_folders()
         dest_location = self.config.get('destination_location', 'script_dir')
-        
-        if active_sources and dest_location == 'script_dir':
-            # Create organized folders in script directory for each active source
+
+        if not active_sources:
             self.sorted_folders = {}
-            for source_folder in active_sources:
-                source_name = self.sanitize_folder_name(os.path.basename(source_folder))
-                source_dest_dir = os.path.join(script_dir, f"sorted_{source_name}")
-                
-                # Create organized folders for this source
-                source_folders = {
-                    k: os.path.join(source_dest_dir, v) 
-                    for k, v in self.config['output_folders'].items()
-                }
-                
-                # Store with source-specific keys for the primary source
-                if source_folder == active_sources[0]:
-                    self.sorted_folders.update(source_folders)
-                
-                # Create folders
-                for folder in source_folders.values():
-                    os.makedirs(folder, exist_ok=True)
-        elif active_sources and dest_location == 'source_dirs':
-            # Create folders directly in source directories
-            primary_source = active_sources[0]
-            self.sorted_folders = {
-                k: os.path.join(primary_source, v) 
-                for k, v in self.config['output_folders'].items()
-            }
-            
-            # Create folders in all active sources
-            for source_folder in active_sources:
-                for folder_name in self.config['output_folders'].values():
-                    folder_path = os.path.join(source_folder, folder_name)
-                    os.makedirs(folder_path, exist_ok=True)
-        elif active_sources and dest_location == 'both':
-            # Primary uses script directory organized structure
-            primary_source = active_sources[0]
-            source_name = self.sanitize_folder_name(os.path.basename(primary_source))
-            source_dest_dir = os.path.join(script_dir, f"sorted_{source_name}")
-            
-            self.sorted_folders = {
-                k: os.path.join(source_dest_dir, v) 
-                for k, v in self.config['output_folders'].items()
-            }
-            
-            # Create both organized and in-source folders
-            for source_folder in active_sources:
-                # Organized folders in script directory
-                source_name = self.sanitize_folder_name(os.path.basename(source_folder))
-                source_dest_dir = os.path.join(script_dir, f"sorted_{source_name}")
-                for folder_name in self.config['output_folders'].values():
-                    folder_path = os.path.join(source_dest_dir, folder_name)
-                    os.makedirs(folder_path, exist_ok=True)
-                
-                # Direct folders in source directory
-                for folder_name in self.config['output_folders'].values():
-                    folder_path = os.path.join(source_folder, folder_name)
-                    os.makedirs(folder_path, exist_ok=True)
-        else:
-            # Fallback to standard behavior if no sources configured
-            self.sorted_folders = {
-                k: os.path.join(script_dir, v) 
-                for k, v in self.config['output_folders'].items()
-            }
-            
-            # Create standard folders
-            for folder in self.sorted_folders.values():
+            self.logger.info("No active source folders configured, no output folders created")
+            return
+
+        output_base = os.path.join(script_dir, self.config.get('output_base', 'output'))
+
+        # Build and create folders for each active source
+        for source_folder in active_sources:
+            if dest_location == 'script_dir':
+                source_folders = self._build_source_folders(source_folder, output_base)
+            else:
+                source_folders = self._build_source_folders(source_folder, source_folder)
+
+            # Primary source populates self.sorted_folders
+            if source_folder == active_sources[0]:
+                self.sorted_folders = source_folders
+
+            # Create all folders on disk
+            for folder in source_folders.values():
                 os.makedirs(folder, exist_ok=True)
-        
+
         # Create auto-sort subfolders
         if self.config['auto_sort_settings'].get('create_subfolders', True):
             self.setup_auto_sort_folders()
@@ -562,8 +576,14 @@ class ConfigManager:
 
     def set_setting(self, key, value):
         """Set a setting value in the appropriate location."""
+        # Top-level scalar keys take priority (mirrors get_setting which reads top-level first).
+        # A key that lives at the top level of the default config should always be written there,
+        # even if it also happens to appear in a nested section (e.g. copy_instead_of_move).
+        top_level_keys = {k for k, v in self.default_config.items() if not isinstance(v, dict)}
+        if key in top_level_keys:
+            self.config[key] = value
         # Check if it belongs in ui_preferences
-        if key in self.default_config.get('ui_preferences', {}):
+        elif key in self.default_config.get('ui_preferences', {}):
             if 'ui_preferences' not in self.config:
                 self.config['ui_preferences'] = {}
             self.config['ui_preferences'][key] = value
@@ -586,29 +606,84 @@ class ConfigManager:
         active_sources = self.config.get('active_sources', {})
         return [folder for folder in source_folders if active_sources.get(folder, True)]
     
+    def get_category_labels(self, source_folder=None):
+        """Get category labels for a source folder, falling back to __default__.
+
+        Returns dict mapping category key ('1','2','3','removed') to
+        {'label': str, 'role': 'keep'|'trash'}.
+        """
+        labels = self.config.get('category_labels', self.default_config['category_labels'])
+        if source_folder and source_folder in labels:
+            return labels[source_folder]
+        return labels.get('__default__', self.default_config['category_labels']['__default__'])
+
+    def set_category_labels(self, source_folder, labels_dict):
+        """Set category labels for a specific source folder (or '__default__').
+
+        Args:
+            source_folder: Source folder path, or '__default__' for the fallback.
+            labels_dict: Dict mapping category key to {'label': str, 'role': str}.
+        """
+        if 'category_labels' not in self.config:
+            self.config['category_labels'] = copy.deepcopy(self.default_config['category_labels'])
+        self.config['category_labels'][source_folder] = labels_dict
+        self.save_config()
+
+    def get_label_for_category(self, source_folder, category):
+        """Get the folder name label for a category and source.
+
+        Returns the label string (used as the actual folder name on disk).
+        """
+        labels = self.get_category_labels(source_folder)
+        cat_info = labels.get(category)
+        if cat_info:
+            return cat_info.get('label', category)
+        return category
+
+    def get_role_for_category(self, source_folder, category):
+        """Get the role ('keep' or 'trash') for a category and source."""
+        labels = self.get_category_labels(source_folder)
+        cat_info = labels.get(category)
+        if cat_info:
+            return cat_info.get('role', 'keep')
+        return 'keep'
+
+    def get_trash_folders(self):
+        """Get all folders with role='trash' across all sources.
+
+        Returns list of dicts with keys: source, category, label, path, role.
+        """
+        trash_folders = []
+        active_sources = self.get_active_source_folders()
+
+        for source_folder in active_sources:
+            labels = self.get_category_labels(source_folder)
+            for category, info in labels.items():
+                if info.get('role') == 'trash':
+                    # Get the actual path for this source+category
+                    path = self.get_destination_folder_for_source(source_folder, category)
+                    if path and os.path.exists(path):
+                        trash_folders.append({
+                            'source': source_folder,
+                            'category': category,
+                            'label': info.get('label', category),
+                            'path': path,
+                            'role': 'trash'
+                        })
+
+        return trash_folders
+
     def get_destination_folder_for_source(self, source_folder, category):
         """Get the appropriate destination folder for a specific source and category."""
         dest_location = self.config.get('destination_location', 'script_dir')
-        folder_name = self.config['output_folders'].get(category, category)
-        
-        if dest_location == 'script_dir':
-            # Organized folders in script directory
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            source_name = self.sanitize_folder_name(os.path.basename(source_folder))
-            source_dest_dir = os.path.join(script_dir, f"sorted_{source_name}")
-            return os.path.join(source_dest_dir, folder_name)
-        elif dest_location == 'source_dirs':
-            # Direct folders in source directory
-            return os.path.join(source_folder, folder_name)
-        elif dest_location == 'both':
-            # Prefer script directory organized structure for primary sorting
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            source_name = self.sanitize_folder_name(os.path.basename(source_folder))
-            source_dest_dir = os.path.join(script_dir, f"sorted_{source_name}")
-            return os.path.join(source_dest_dir, folder_name)
-        else:
-            # Fallback
-            return os.path.join(source_folder, folder_name)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_base = os.path.join(script_dir, self.config.get('output_base', 'output'))
+
+        folders = self._build_source_folders(
+            source_folder,
+            output_base if dest_location == 'script_dir' else source_folder
+        )
+        return folders.get(category)
     
     def get_multi_tag_mode(self):
         """Get the current multi-tag sorting mode (thread-safe)."""

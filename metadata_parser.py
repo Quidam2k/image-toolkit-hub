@@ -13,6 +13,7 @@ Version: 2.1
 """
 
 import os
+import html
 import json
 import re
 import time
@@ -104,66 +105,307 @@ class MetadataParser:
         return metadata
     
     def extract_png_metadata(self, image_path):
-        """Extract metadata from PNG text chunks."""
+        """Extract metadata from PNG text chunks (plus EXIF/XMP when present)."""
         metadata = {}
-        
+
         try:
             with Image.open(image_path) as img:
                 if hasattr(img, 'text') and img.text:
                     for key, value in img.text.items():
                         metadata[key] = value
+                self._read_exif(img, metadata)
+                self._read_xmp(img, metadata)
         except Exception as e:
             self.logger.error(f"Error reading PNG metadata from {image_path}: {e}")
-        
+
         return metadata
-    
+
     def extract_jpeg_metadata(self, image_path):
-        """Extract metadata from JPEG EXIF data."""
+        """Extract metadata from JPEG EXIF and XMP data."""
         metadata = {}
-        
+
         try:
             with Image.open(image_path) as img:
-                exif_data = img.getexif()
-                
-                if exif_data:
-                    for tag_id, value in exif_data.items():
-                        tag = TAGS.get(tag_id, str(tag_id))
-                        
-                        # Convert bytes to string if needed
-                        if isinstance(value, bytes):
-                            try:
-                                value = value.decode('utf-8', errors='ignore')
-                            except (UnicodeDecodeError, AttributeError):
-                                continue
-                        
-                        metadata[tag] = value
-                        
-                        # Look for SD parameters in specific fields
-                        if tag in ['UserComment', 'ImageDescription', 'XPComment']:
-                            if isinstance(value, str) and any(keyword in value.lower() for keyword in ['steps:', 'sampler:', 'cfg scale:']):
-                                metadata['parameters'] = value
-                            # Check for embedded tags
-                            elif isinstance(value, str) and 'TAGS:' in value:
-                                self._extract_embedded_tags_from_field(metadata, value)
+                self._read_exif(img, metadata)
+                self._read_xmp(img, metadata)
         except Exception as e:
             self.logger.error(f"Error reading JPEG EXIF from {image_path}: {e}")
-        
+
         return metadata
-    
+
     def extract_webp_metadata(self, image_path):
-        """Extract metadata from WebP images."""
+        """Extract metadata from WebP images (info strings, EXIF, XMP)."""
         metadata = {}
-        
+
         try:
             with Image.open(image_path) as img:
                 if hasattr(img, 'info') and img.info:
                     for key, value in img.info.items():
                         if isinstance(value, str):
                             metadata[key] = value
+                self._read_exif(img, metadata)
+                self._read_xmp(img, metadata)
         except Exception as e:
             self.logger.error(f"Error reading WebP metadata from {image_path}: {e}")
-        
+
         return metadata
+
+    def _decode_exif_bytes(self, tag, value):
+        """Decode an EXIF bytes value, honouring UserComment/XP* encodings."""
+        if tag == 'UserComment' and len(value) >= 8:
+            prefix, body = value[:8], value[8:]
+            if prefix == b'UNICODE\x00':
+                # Byte order is not recorded; pick the decode that looks like text.
+                candidates = [body.decode(enc, errors='ignore') for enc in ('utf-16-be', 'utf-16-le')]
+                return max(candidates, key=lambda s: sum(1 for c in s if ' ' <= c <= '~')).strip('\x00')
+            if prefix == b'ASCII\x00\x00\x00':
+                return body.decode('ascii', errors='ignore').strip('\x00')
+        if tag.startswith('XP'):
+            return value.decode('utf-16-le', errors='ignore').strip('\x00')
+        return value.decode('utf-8', errors='ignore').strip('\x00')
+
+    def _read_exif(self, img, metadata):
+        """Copy EXIF tags (base IFD + Exif IFD, where UserComment lives) into metadata."""
+        try:
+            exif_data = img.getexif()
+        except Exception:
+            return
+        if not exif_data:
+            return
+
+        items = list(exif_data.items())
+        try:
+            items += list(exif_data.get_ifd(0x8769).items())
+        except Exception:
+            pass
+
+        for tag_id, value in items:
+            tag = TAGS.get(tag_id, str(tag_id))
+
+            # Convert bytes to string if needed
+            if isinstance(value, bytes):
+                try:
+                    value = self._decode_exif_bytes(tag, value)
+                except (UnicodeDecodeError, AttributeError):
+                    continue
+
+            metadata[tag] = value
+            if not isinstance(value, str):
+                continue
+
+            # ComfyUI WebP/JPEG savers stash the graph in EXIF as "prompt:{json}"
+            if value.startswith('prompt:'):
+                metadata.setdefault('prompt', value[len('prompt:'):])
+            elif value.startswith('workflow:'):
+                metadata.setdefault('workflow', value[len('workflow:'):])
+
+            # Look for SD parameters in specific fields
+            if tag in ['UserComment', 'ImageDescription', 'XPComment']:
+                if any(keyword in value.lower() for keyword in ['steps:', 'sampler:', 'cfg scale:']):
+                    metadata['parameters'] = value
+                # Check for embedded tags
+                elif 'TAGS:' in value:
+                    self._extract_embedded_tags_from_field(metadata, value)
+
+    def _read_xmp(self, img, metadata):
+        """Pull dc:description out of the raw XMP packet (no defusedxml needed)."""
+        raw = img.info.get('xmp') or img.info.get('XML:com.adobe.xmp')
+        if not raw:
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', errors='ignore')
+        match = re.search(r'<dc:description>.*?<rdf:li[^>]*>(.*?)</rdf:li>', raw, re.DOTALL)
+        if not match:
+            match = re.search(r'dc:description="([^"]*)"', raw)
+        if match:
+            text = html.unescape(match.group(1)).strip()
+            if text:
+                metadata['xmp_description'] = text
+
+    # ------------------------------------------------------------------
+    # Prompt lookup across generators (A1111, ComfyUI, Midjourney)
+    # ------------------------------------------------------------------
+
+    _COMFY_TEXT_KEYS = ('text', 'text_g', 'text_l', 't5xxl', 'clip_l', 'prompt', 'string',
+                        'value', 'text_a', 'text_b', 'string_a', 'string_b', 'text1', 'text2')
+    _COMFY_COND_KEYS = ('conditioning', 'conditioning_1', 'conditioning_2',
+                        'conditioning_to', 'conditioning_from', 'guider')
+
+    def get_prompt_text(self, metadata):
+        """Best-effort positive prompt for an image. Returns (text, source).
+
+        Sources tried in order: A1111 positive_prompt, ComfyUI graph, Midjourney/
+        description fields, companion tags, raw parameters. ("", "") if none.
+        """
+        if not metadata:
+            return "", ""
+
+        text = metadata.get('positive_prompt')
+        if isinstance(text, str) and text.strip():
+            return text.strip(), 'a1111'
+
+        text = self._comfy_prompt_text(metadata.get('prompt'), metadata.get('workflow'))
+        if text:
+            return text, 'comfyui'
+
+        for key in ('Description', 'xmp_description', 'ImageDescription'):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                cleaned = re.sub(r'\s*Job ID:\s*[0-9a-fA-F-]+\s*$', '', value.strip()).strip()
+                if cleaned:
+                    is_mj = cleaned != value.strip() or ' --' in cleaned
+                    return cleaned, ('midjourney' if is_mj else 'description')
+
+        for key, source in (('tags', 'tags'), ('parameters', 'parameters'), ('raw_parameters', 'parameters')):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), source
+
+        return "", ""
+
+    @staticmethod
+    def _is_comfy_link(value):
+        return (isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], (str, int)) and isinstance(value[1], int))
+
+    # Display/echo nodes (ShowText|pysssss and friends) mirror the *runtime* value
+    # of the link they consume into numbered widget strings. That value is the
+    # wildcard-resolved prompt, whereas the upstream template node still holds the
+    # unresolved ``||wildcard||`` text.
+    _COMFY_ECHO_LINK_KEYS = ('text', 'string', 'anything', 'any', 'value', 'input',
+                             'text_input', 'source')
+    _COMFY_ECHO_VALUE_RE = re.compile(r'^(?:text|string|value|output|anything)_(\d+)$')
+
+    def _comfy_resolved_texts(self, nodes):
+        """Map '<src_node>:<slot>' -> echoed runtime text, from display/echo nodes."""
+        resolved = {}
+        for node in nodes.values():
+            inputs = node.get('inputs')
+            if not isinstance(inputs, dict):
+                continue
+            link = next((inputs[k] for k in self._COMFY_ECHO_LINK_KEYS
+                         if self._is_comfy_link(inputs.get(k))), None)
+            if link is None:
+                continue
+            parts = []
+            for key, value in inputs.items():
+                match = self._COMFY_ECHO_VALUE_RE.match(str(key))
+                if match and isinstance(value, str) and value.strip():
+                    parts.append((int(match.group(1)), value.strip()))
+            if not parts:
+                continue
+            # Key on node *and* slot: one node can echo several outputs of another
+            # (e.g. a dedupe report on slot 1 alongside the prompt on slot 0).
+            resolved.setdefault('{}:{}'.format(link[0], link[1]),
+                                '\n'.join(v for _, v in sorted(parts)))
+        return resolved
+
+    def _comfy_follow(self, graph, link, polarity, visited, texts, resolved=None):
+        """Walk upstream from a conditioning/text link, collecting prompt strings."""
+        if resolved:
+            # Stop at the last node whose output was echoed: that is the populated
+            # prompt, after wildcards/expanders have been evaluated.
+            echoed = resolved.get('{}:{}'.format(link[0], link[1]))
+            if echoed:
+                if echoed not in texts:
+                    texts.append(echoed)
+                return
+        node_id = str(link[0])
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        node = graph.get(node_id)
+        if not isinstance(node, dict):
+            return
+        inputs = node.get('inputs')
+        if not isinstance(inputs, dict):
+            return
+
+        found_text = False
+        for key in self._COMFY_TEXT_KEYS:
+            value = inputs.get(key)
+            if isinstance(value, str):
+                found_text = True
+                if value.strip() and value.strip() not in texts:
+                    texts.append(value.strip())
+            elif self._is_comfy_link(value):
+                found_text = True
+                self._comfy_follow(graph, value, polarity, visited, texts, resolved)
+        if found_text:
+            return
+
+        # Pass-through node (combine/concat/controlnet/guidance/guider): keep walking.
+        for key in (polarity,) + self._COMFY_COND_KEYS:
+            value = inputs.get(key)
+            if self._is_comfy_link(value):
+                self._comfy_follow(graph, value, polarity, visited, texts, resolved)
+
+    def _comfy_prompt_text(self, prompt_chunk, workflow_chunk=None):
+        """Extract the positive prompt from ComfyUI 'prompt' (API graph) / 'workflow' chunks."""
+        graph = self._load_json_chunk(prompt_chunk)
+        if isinstance(graph, dict):
+            nodes = {str(k): v for k, v in graph.items() if isinstance(v, dict)}
+            resolved = self._comfy_resolved_texts(nodes)
+
+            # 1. Follow each sampler's positive (or guider) input.
+            texts = []
+            for node in nodes.values():
+                inputs = node.get('inputs')
+                if 'sampler' not in str(node.get('class_type', '')).lower() or not isinstance(inputs, dict):
+                    continue
+                for key in ('positive', 'guider'):
+                    if self._is_comfy_link(inputs.get(key)):
+                        self._comfy_follow(nodes, inputs[key], 'positive', set(), texts, resolved)
+            if texts:
+                return ', '.join(texts)
+
+            # 2. Any CLIPTextEncode text not reachable from a negative input.
+            negative_ids = set()
+            for node in nodes.values():
+                inputs = node.get('inputs')
+                if isinstance(inputs, dict) and self._is_comfy_link(inputs.get('negative')):
+                    self._comfy_follow(nodes, inputs['negative'], 'negative', negative_ids, [])
+            for node_id, node in nodes.items():
+                if node_id in negative_ids or 'cliptextencode' not in str(node.get('class_type', '')).lower():
+                    continue
+                self._comfy_follow(nodes, [node_id, 0], 'positive', set(), texts, resolved)
+            if texts:
+                return ', '.join(texts)
+
+        # 3. Last resort: widget strings on text-encode nodes in the UI workflow.
+        workflow = self._load_json_chunk(workflow_chunk)
+        if isinstance(workflow, dict) and isinstance(workflow.get('nodes'), list):
+            link_source = {}
+            for link in workflow.get('links') or []:
+                if isinstance(link, list) and len(link) >= 2:
+                    link_source[link[0]] = link[1]
+            negative_nodes = set()
+            for node in workflow['nodes']:
+                for inp in (node.get('inputs') or []) if isinstance(node, dict) else []:
+                    if isinstance(inp, dict) and inp.get('name') == 'negative' and inp.get('link') in link_source:
+                        negative_nodes.add(link_source[inp['link']])
+            texts = []
+            for node in workflow['nodes']:
+                if not isinstance(node, dict) or 'textencode' not in str(node.get('type', '')).lower():
+                    continue
+                if node.get('id') in negative_nodes or 'neg' in str(node.get('title', '')).lower():
+                    continue
+                for value in node.get('widgets_values') or []:
+                    if isinstance(value, str) and value.strip() and value.strip() not in texts:
+                        texts.append(value.strip())
+            if texts:
+                return ', '.join(texts)
+
+        return ""
+
+    @staticmethod
+    def _load_json_chunk(chunk):
+        if not isinstance(chunk, str) or not chunk.strip().startswith('{'):
+            return None
+        try:
+            return json.loads(chunk)
+        except (ValueError, RecursionError):
+            return None
     
     def extract_tag_file(self, image_path):
         """Extract content from companion .txt tag file."""
