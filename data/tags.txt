@@ -1,7 +1,7 @@
  Volume in drive C has no label.
  Volume Serial Number is 3291-1D6D
 
- Directory of C:\Users\Todd\Desktop\src\removed
+ Directory of <folder>
 
 07/13/2025  10:11 AM    <DIR>          .
 06/14/2025  09:50 PM    <DIR>          ..

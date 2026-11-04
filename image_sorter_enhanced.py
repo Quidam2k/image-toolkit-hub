@@ -963,7 +963,7 @@ class ImageSorter(tk.Frame):
         h3_bridge.comfy_workflows_path). Raises ImportError if it is missing."""
         if self._h3_queue is None:
             path = self.config_manager.config.get('h3_bridge', {}).get(
-                'comfy_workflows_path', r'Q:\Development\comfy_workflows')
+                'comfy_workflows_path', os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, 'comfy_workflows'))
             if path not in sys.path:
                 sys.path.append(path)
             import h3_sorter_queue

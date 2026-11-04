@@ -100,3 +100,13 @@ aux
 
 # Persistent thumbnail cache (regenerable)
 data/thumb_cache/
+
+# Internal working material and one-off local migration scripts (kept locally, not published)
+/notes/
+/cascades/
+/.claude/
+NOTE-*
+session-state.md
+CLAUDE.local.md
+/scripts/delete_h_migration.ps1
+/scripts/verify_h_migration.ps1
