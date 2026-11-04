@@ -1,6 +1,6 @@
-# Enhanced Image Grid Sorter
+# Image Toolkit Hub
 
-A comprehensive Python/Tkinter toolkit for visually sorting and organizing large image collections with AI-powered classification and auto-sorting capabilities.
+A comprehensive Python/Tkinter toolkit for visually sorting and organizing large image collections with AI-powered classification and auto-sorting capabilities. The hub launches the Enhanced Image Grid Sorter and the related auto-sort, classification and export tools.
 
 ## Quick Start
 
@@ -146,3 +146,7 @@ image_grid_sorter/
 - **v2.1**: Added multi-source support, organized destination folders, improved large image handling
 - **v2.0**: Enhanced auto-sorting, multi-tag support, metadata embedding
 - **v1.x**: Original grid-based sorting functionality
+
+## License
+
+MIT, see [LICENSE](LICENSE).
