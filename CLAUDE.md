@@ -558,3 +558,7 @@ Previous updates (January 8, 2026):
 - Added Visual Classification system for WAN video LoRA first frame selection
 - Project reorganization (tests/, scripts/, docs/, data/, logs/, archive/ folders)
 - Multi-session sorting feature (hide already-copied images)
+
+## Inbox (#6448)
+
+Asks and FYIs filed for this project land in `inbox/` at the project root, one markdown file each. **At the start of every session, list `inbox/*.md` and read any file there.** Act on it, then move the file to `inbox/done/`; never delete one.
