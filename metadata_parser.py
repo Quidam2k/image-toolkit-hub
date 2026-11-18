@@ -244,7 +244,8 @@ class MetadataParser:
         if isinstance(text, str) and text.strip():
             return text.strip(), 'a1111'
 
-        text = self._comfy_prompt_text(metadata.get('prompt'), metadata.get('workflow'))
+        text = self._comfy_prompt_text(metadata.get('prompt'), metadata.get('workflow'),
+                                        metadata.get('resolved_prompt'))
         if text:
             return text, 'comfyui'
 
@@ -276,10 +277,18 @@ class MetadataParser:
                              'text_input', 'source')
     _COMFY_ECHO_VALUE_RE = re.compile(r'^(?:text|string|value|output|anything)_(\d+)$')
 
-    def _comfy_resolved_texts(self, nodes):
-        """Map '<src_node>:<slot>' -> echoed runtime text, from display/echo nodes."""
+    def _comfy_resolved_texts(self, nodes, workflow=None):
+        """Map '<src_node>:<slot>' -> echoed runtime text, from display/echo nodes.
+
+        The API graph's ``text_N`` echoes are written by the browser and are STALE on
+        images made before the 2026-11-18 ShowText stamp (they hold what the previous
+        run displayed). The ``workflow`` chunk's widget values are written server-side
+        and are the truth, so when a workflow chunk exists it replaces the echo
+        (and a node it has no text for contributes nothing).
+        """
+        wf_texts = self._workflow_widget_texts(workflow) if workflow else None
         resolved = {}
-        for node in nodes.values():
+        for node_id, node in nodes.items():
             inputs = node.get('inputs')
             if not isinstance(inputs, dict):
                 continue
@@ -287,21 +296,67 @@ class MetadataParser:
                          if self._is_comfy_link(inputs.get(k))), None)
             if link is None:
                 continue
-            parts = []
-            for key, value in inputs.items():
-                match = self._COMFY_ECHO_VALUE_RE.match(str(key))
-                if match and isinstance(value, str) and value.strip():
-                    parts.append((int(match.group(1)), value.strip()))
-            if not parts:
-                continue
+            if wf_texts is not None:
+                text = wf_texts.get(node_id) or wf_texts.get(str(node_id).split(':')[-1])
+                if not text:
+                    continue
+            else:
+                parts = []
+                for key, value in inputs.items():
+                    match = self._COMFY_ECHO_VALUE_RE.match(str(key))
+                    if match and isinstance(value, str) and value.strip():
+                        parts.append((int(match.group(1)), value.strip()))
+                if not parts:
+                    continue
+                text = '\n'.join(v for _, v in sorted(parts))
             # Key on node *and* slot: one node can echo several outputs of another
             # (e.g. a dedupe report on slot 1 alongside the prompt on slot 0).
-            resolved.setdefault('{}:{}'.format(link[0], link[1]),
-                                '\n'.join(v for _, v in sorted(parts)))
+            resolved.setdefault('{}:{}'.format(link[0], link[1]), text)
         return resolved
 
-    def _comfy_follow(self, graph, link, polarity, visited, texts, resolved=None):
+    @staticmethod
+    def _workflow_widget_texts(workflow):
+        """{node_id: joined non-empty widget strings} for every node in a workflow chunk
+        (top level and subgraph definitions). Lists are flattened (ShowText stores [[text]])."""
+        def flat(values):
+            for v in values or []:
+                if isinstance(v, str):
+                    if v.strip():
+                        yield v.strip()
+                elif isinstance(v, list):
+                    yield from flat(v)
+
+        out = {}
+        node_lists = [workflow.get('nodes')]
+        defs = workflow.get('definitions')
+        if isinstance(defs, dict):
+            for sub in defs.get('subgraphs') or []:
+                if isinstance(sub, dict):
+                    node_lists.append(sub.get('nodes'))
+        for nodes in node_lists:
+            for node in nodes if isinstance(nodes, list) else []:
+                if isinstance(node, dict) and 'id' in node:
+                    text = '\n'.join(flat(node.get('widgets_values')))
+                    if text:
+                        out.setdefault(str(node['id']), text)
+        return out
+
+    @staticmethod
+    def _stamped_texts(resolved_chunk):
+        """{node_id: text} from the resolved_prompt chunk LoraDedupe stamps server-side."""
+        data = MetadataParser._load_json_chunk(resolved_chunk)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): v.strip() for k, v in data.items() if isinstance(v, str) and v.strip()}
+
+    def _comfy_follow(self, graph, link, polarity, visited, texts, resolved=None, stamped=None):
         """Walk upstream from a conditioning/text link, collecting prompt strings."""
+        if stamped and link[1] == 0 and str(link[0]) in stamped:
+            # Server-stamped final prompt (resolved_prompt chunk): the authority.
+            text = stamped[str(link[0])]
+            if text not in texts:
+                texts.append(text)
+            return
         if resolved:
             # Stop at the last node whose output was echoed: that is the populated
             # prompt, after wildcards/expanders have been evaluated.
@@ -330,7 +385,7 @@ class MetadataParser:
                     texts.append(value.strip())
             elif self._is_comfy_link(value):
                 found_text = True
-                self._comfy_follow(graph, value, polarity, visited, texts, resolved)
+                self._comfy_follow(graph, value, polarity, visited, texts, resolved, stamped)
         if found_text:
             return
 
@@ -338,14 +393,21 @@ class MetadataParser:
         for key in (polarity,) + self._COMFY_COND_KEYS:
             value = inputs.get(key)
             if self._is_comfy_link(value):
-                self._comfy_follow(graph, value, polarity, visited, texts, resolved)
+                self._comfy_follow(graph, value, polarity, visited, texts, resolved, stamped)
 
-    def _comfy_prompt_text(self, prompt_chunk, workflow_chunk=None):
-        """Extract the positive prompt from ComfyUI 'prompt' (API graph) / 'workflow' chunks."""
+    def _comfy_prompt_text(self, prompt_chunk, workflow_chunk=None, resolved_chunk=None):
+        """Extract the positive prompt from ComfyUI 'prompt' (API graph) / 'workflow' chunks.
+
+        Trust order: resolved_prompt chunk (server-stamped) > workflow-chunk ShowText
+        values (server-written) > template text. The API graph's own ShowText echoes are
+        never trusted when a workflow chunk exists (they can be the previous image's).
+        """
         graph = self._load_json_chunk(prompt_chunk)
         if isinstance(graph, dict):
             nodes = {str(k): v for k, v in graph.items() if isinstance(v, dict)}
-            resolved = self._comfy_resolved_texts(nodes)
+            stamped = self._stamped_texts(resolved_chunk)
+            resolved = {} if stamped else self._comfy_resolved_texts(
+                nodes, self._load_json_chunk(workflow_chunk))
 
             # 1. Follow each sampler's positive (or guider) input.
             texts = []
@@ -355,7 +417,10 @@ class MetadataParser:
                     continue
                 for key in ('positive', 'guider'):
                     if self._is_comfy_link(inputs.get(key)):
-                        self._comfy_follow(nodes, inputs[key], 'positive', set(), texts, resolved)
+                        self._comfy_follow(nodes, inputs[key], 'positive', set(), texts, resolved, stamped)
+            if stamped and not any(t in stamped.values() for t in texts):
+                # Stamp exists but the positive walk never crossed a stamped node.
+                return next(iter(stamped.values()))
             if texts:
                 return ', '.join(texts)
 
@@ -368,7 +433,7 @@ class MetadataParser:
             for node_id, node in nodes.items():
                 if node_id in negative_ids or 'cliptextencode' not in str(node.get('class_type', '')).lower():
                     continue
-                self._comfy_follow(nodes, [node_id, 0], 'positive', set(), texts, resolved)
+                self._comfy_follow(nodes, [node_id, 0], 'positive', set(), texts, resolved, stamped)
             if texts:
                 return ', '.join(texts)
 

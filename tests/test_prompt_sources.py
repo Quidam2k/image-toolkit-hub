@@ -440,6 +440,58 @@ def case_18_comfyui_wildcard_echo(temp_dir):
     assert "dupe report" not in text
 
 
+def _echo_graph(echo_text):
+    graph = basic_graph()
+    graph["6"]["inputs"]["text"] = ["20", 0]
+    graph["20"] = {
+        "class_type": "LoraDedupe",
+        "inputs": {"text": "a photo of ||animal|| in ||place||"},
+    }
+    graph["62"] = {
+        "class_type": "ShowText|pysssss",
+        "inputs": {"text": ["20", 0], "text_0": echo_text},
+    }
+    return graph
+
+
+def case_19_stamped_beats_stale_echo(temp_dir):
+    """resolved_prompt (server-stamped) wins over the browser-written API echo."""
+    path = os.path.join(temp_dir, "case19.png")
+    graph = _echo_graph("PREVIOUS image text")
+    workflow = {"nodes": [{"id": 62, "type": "ShowText|pysssss",
+                           "widgets_values": [["wrong too"]]}]}
+    save_png(path, {"prompt": json.dumps(graph), "workflow": json.dumps(workflow),
+                    "resolved_prompt": json.dumps({"20": "the real fox in a forest"})})
+    assert_prompt(path, "the real fox in a forest", "comfyui")
+
+
+def case_20_unstamped_uses_workflow_chunk(temp_dir):
+    """No stamp: the workflow chunk's ShowText value (server-written) beats the stale echo."""
+    path = os.path.join(temp_dir, "case20.png")
+    graph = _echo_graph("PREVIOUS image text")
+    workflow = {"nodes": [{"id": 62, "type": "ShowText|pysssss",
+                           "widgets_values": [["the real fox in a forest"]]}]}
+    save_png(path, {"prompt": json.dumps(graph), "workflow": json.dumps(workflow)})
+    assert_prompt(path, "the real fox in a forest", "comfyui")
+
+
+def case_21_unstamped_no_workflow_text_uses_template(temp_dir):
+    """Workflow chunk exists but has no text for the echo node: honest template, not the stale echo."""
+    path = os.path.join(temp_dir, "case21.png")
+    graph = _echo_graph("PREVIOUS image text")
+    workflow = {"nodes": [{"id": 62, "type": "ShowText|pysssss", "widgets_values": [[]]}]}
+    save_png(path, {"prompt": json.dumps(graph), "workflow": json.dumps(workflow)})
+    assert_prompt(path, "a photo of ||animal|| in ||place||", "comfyui")
+
+
+def case_22_stamp_off_positive_path(temp_dir):
+    """Stamp present but its node is not on the positive path: still use the stamp, not the template."""
+    path = os.path.join(temp_dir, "case22.png")
+    save_png(path, {"prompt": json.dumps(basic_graph()),
+                    "resolved_prompt": json.dumps({"99": "stamped text"})})
+    assert_prompt(path, "stamped text", "comfyui")
+
+
 CASES = [
     ("01 A1111 PNG", case_01_a1111_png),
     ("02 ComfyUI PNG basic", case_02_comfyui_basic),
@@ -459,6 +511,10 @@ CASES = [
     ("16 Empty image", case_16_empty),
     ("17 Empty metadata", case_17_empty_metadata),
     ("18 ComfyUI wildcard echo", case_18_comfyui_wildcard_echo),
+    ("19 Stamped beats stale echo", case_19_stamped_beats_stale_echo),
+    ("20 Unstamped uses workflow chunk", case_20_unstamped_uses_workflow_chunk),
+    ("21 Unstamped no workflow text -> template", case_21_unstamped_no_workflow_text_uses_template),
+    ("22 Stamp off positive path", case_22_stamp_off_positive_path),
 ]
 
 
